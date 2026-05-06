@@ -1,0 +1,65 @@
+[package]
+name = "remotecontrol-server"
+version = "0.1.0"
+edition = "2021"
+description = "Windows PC server for phone remote control"
+
+[lib]
+name = "remotecontrol_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "remotecontrol-server"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+rand = "0.8"
+base64 = "0.22"
+hmac = "0.12"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+
+qrcode = "0.14"
+
+if-addrs = "0.13"
+
+# Opus codec for M5 audio. Vendored libopus via cc, builds on Windows MSVC.
+opus = "0.3"
+
+# Windows-only: DXGI Desktop Duplication for capture, Media Foundation for H.264 encode.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Audio",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">RemoteControl</string>
+    <string name="scan_to_connect">扫码连接电脑</string>
+    <string name="camera_permission_needed">需要相机权限才能扫码</string>
+    <string name="grant_permission">授予权限</string>
+    <string name="disconnect">断开连接</string>
+    <string name="connecting">正在连接…</string>
+    <string name="connected_to">已连接到</string>
+    <string name="not_connected">未连接</string>
+    <string name="invalid_qr">二维码无效</string>
+</resources>

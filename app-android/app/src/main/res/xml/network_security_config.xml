@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    M1 stage: allow cleartext ws:// to any host (LAN-only use case).
+
+    Note: Android's <domain> tag does NOT support CIDR ranges, so the previous
+    192.168.0.0/16 / 10.0.0.0/8 entries silently matched nothing and left the
+    default cleartext-blocked policy in effect. Until we move to wss:// with a
+    pinned self-signed cert in M1.5, the simplest correct fix is base-config.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

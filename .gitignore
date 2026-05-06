@@ -1,0 +1,26 @@
+# ---- Rust (server-pc) ----
+server-pc/target/
+# Cargo.lock kept — this is a binary, lockfile is desirable
+
+# Auto-generated demo artifacts
+server-pc/qrcode.html
+server-pc/test_capture.h264
+
+# ---- Android (app-android) ----
+*.iml
+.gradle/
+.kotlin/
+*.salive
+local.properties
+.idea/
+.DS_Store
+app-android/build/
+app-android/app/build/
+app-android/captures/
+app-android/.externalNativeBuild
+app-android/.cxx
+
+# ---- Misc ----
+.vscode/
+.claude/
+*.log
