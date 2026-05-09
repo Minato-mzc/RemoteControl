@@ -21,10 +21,10 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
     D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
-use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
-    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO,
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
+    IDXGIResource, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO,
 };
 
 use crate::video::{CapturedFrame, PixelFormat};
@@ -32,9 +32,11 @@ use crate::video::{CapturedFrame, PixelFormat};
 pub struct DxgiCapture {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
+    adapter: IDXGIAdapter1,
     duplication: IDXGIOutputDuplication,
     width: u32,
     height: u32,
+    pixel_format: DXGI_FORMAT,
     started_at: Instant,
     staging: Option<ID3D11Texture2D>,
     frame_buf: Vec<u8>,
@@ -76,13 +78,16 @@ impl DxgiCapture {
             let desc: DXGI_OUTDUPL_DESC = duplication.GetDesc();
             let width = desc.ModeDesc.Width;
             let height = desc.ModeDesc.Height;
+            let pixel_format = desc.ModeDesc.Format;
 
             Ok(Self {
                 device,
                 context,
+                adapter,
                 duplication,
                 width,
                 height,
+                pixel_format,
                 started_at: Instant::now(),
                 staging: None,
                 frame_buf: Vec::with_capacity((width as usize) * (height as usize) * 4),
@@ -93,6 +98,81 @@ impl DxgiCapture {
 
     pub fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    /// Borrow the D3D11 device used to capture. NVENC SDK needs this both
+    /// as the encode device (when opening the session) and to allocate
+    /// input textures whose lifetime exceeds a single AcquireNextFrame.
+    pub fn device(&self) -> &ID3D11Device {
+        &self.device
+    }
+
+    /// Borrow the deferred / immediate D3D11 context. Required to
+    /// `CopyResource` from the duplication frame into a long-lived
+    /// NVENC input texture without touching CPU memory.
+    pub fn context(&self) -> &ID3D11DeviceContext {
+        &self.context
+    }
+
+    /// DXGI duplication's output format. On Windows 10/11 this is
+    /// `DXGI_FORMAT_B8G8R8A8_UNORM` for the standard desktop. NVENC's
+    /// `NV_ENC_BUFFER_FORMAT_ARGB` expects exactly that layout.
+    pub fn pixel_format(&self) -> DXGI_FORMAT {
+        self.pixel_format
+    }
+
+    /// GPU zero-copy path used by the NVENC-SDK backend.
+    ///
+    /// Acquires the next desktop-duplication frame, `CopyResource`'s it
+    /// into the caller-owned `dst` texture, then releases the frame so
+    /// the duplication queue isn't held across the whole encode.
+    /// Returns `Ok(false)` on timeout (no screen change since the last
+    /// call), `Ok(true)` on a fresh frame, `Err` on hard failure.
+    ///
+    /// `dst` must be a `D3D11_USAGE_DEFAULT` BGRA texture matching the
+    /// capture dimensions; allocate it once, reuse it across frames.
+    pub fn next_frame_into(
+        &mut self,
+        dst: &ID3D11Texture2D,
+        timeout_ms: u32,
+    ) -> Result<bool> {
+        unsafe {
+            if self.holding_frame {
+                let _ = self.duplication.ReleaseFrame();
+                self.holding_frame = false;
+            }
+
+            let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+            let mut resource: Option<IDXGIResource> = None;
+            let acquire = self
+                .duplication
+                .AcquireNextFrame(timeout_ms, &mut info, &mut resource);
+            match acquire {
+                Ok(()) => {}
+                Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(false),
+                Err(e) => return Err(anyhow::anyhow!("AcquireNextFrame: {e}")),
+            }
+            self.holding_frame = true;
+            let resource = resource.context("AcquireNextFrame returned null IDXGIResource")?;
+            let src: ID3D11Texture2D = resource.cast().context("cast to ID3D11Texture2D")?;
+
+            // GPU-side blit. Driver routes this through the GPU copy engine,
+            // no CPU map / system-memory bounce.
+            self.context.CopyResource(dst, &src);
+
+            // Release the duplication slot now so the OS can give us the
+            // next frame while NVENC is still chewing on this one.
+            let _ = self.duplication.ReleaseFrame();
+            self.holding_frame = false;
+            Ok(true)
+        }
+    }
+
+    /// PTS for a fresh frame, in microseconds since `DxgiCapture::new()`
+    /// completed. NVENC accepts arbitrary PTS values; we feed it the same
+    /// monotonic base the audio worker uses so the phone can A/V-sync.
+    pub fn pts_us(&self) -> u64 {
+        self.started_at.elapsed().as_micros().min(u64::MAX as u128) as u64
     }
 
     /// Block up to `timeout_ms` for the next frame. Returns `Ok(None)` on
@@ -187,3 +267,4 @@ impl Drop for DxgiCapture {
         }
     }
 }
+

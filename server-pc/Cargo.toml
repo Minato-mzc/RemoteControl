@@ -3,10 +3,23 @@ name = "remotecontrol-server"
 version = "0.1.0"
 edition = "2021"
 description = "Windows PC server for phone remote control"
+# NVENC SDK direct integration (M4-B): bindgen runs in build.rs against
+# vendor/nv-codec-headers/include/ffnvcodec/nvEncodeAPI.h to produce
+# Rust FFI in $OUT_DIR/nvenc_sys.rs, which encoder/nvenc_sys.rs include!()s.
+# We don't link nvEncodeAPI64.dll — encoder/nvenc_sdk.rs LoadLibraryW's it
+# at runtime so the binary still launches on machines without an NVIDIA
+# GPU (falls back to MFT-software / MFT-hardware H.264 there).
+build = "build.rs"
 
 [lib]
 name = "remotecontrol_server"
 path = "src/lib.rs"
+
+[build-dependencies]
+bindgen = "0.70"
+
+[dev-dependencies]
+tempfile = "3"
 
 [[bin]]
 name = "remotecontrol-server"
@@ -38,6 +51,20 @@ if-addrs = "0.13"
 # Opus codec for M5 audio. Vendored libopus via cc, builds on Windows MSVC.
 opus = "0.3"
 
+# SIMD-accelerated image resize (M4: 1080p → 720p before encoding).
+fast_image_resize = "5"
+
+# M4-B: NVENC SDK direct integration loads `nvEncodeAPI64.dll` at runtime
+# via libloading so the binary still launches on machines without an
+# NVIDIA driver (the SDK encoder constructor returns Err and stream.rs
+# falls back to the MFT path).
+libloading = "0.8"
+
+# Cross-network relay client: HTTP POST to register, TOML for the
+# resulting host_id/host_token persistence.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+toml = "0.8"
+
 # Windows-only: DXGI Desktop Duplication for capture, Media Foundation for H.264 encode.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
@@ -48,6 +75,11 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    # NVENC SDK direct integration (M4-B): need to acquire and signal Win32
+    # event objects to wait on async encoder output instead of polling.
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemServices",
+    "Win32_Security",
     "Win32_Media_MediaFoundation",
     "Win32_Media_KernelStreaming",
     "Win32_Media_Audio",
@@ -58,8 +90,3 @@ windows = { version = "0.58", features = [
     "Win32_UI_Input_KeyboardAndMouse",
 ] }
 
-[profile.release]
-opt-level = 3
-lto = "thin"
-codegen-units = 1
-strip = true

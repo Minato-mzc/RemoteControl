@@ -11,6 +11,20 @@ pub enum ClientMsg {
         #[serde(default)]
         client: ClientInfo,
     },
+
+    /// "I've paired with this server before, here's the long-lived token I
+    /// got back then." Lets the phone reconnect without scanning a QR code
+    /// every time the server restarts. The token is a 256-bit random value
+    /// minted by the server on the first successful Hello and remembered
+    /// in `trusted_devices.json`.
+    #[serde(rename = "trusted_hello")]
+    TrustedHello {
+        v: u32,
+        device_id: String,
+        token: String,
+        #[serde(default)]
+        client: ClientInfo,
+    },
     #[serde(rename = "ping")]
     Ping {
         #[serde(default)]
@@ -113,6 +127,17 @@ pub enum ServerMsg {
         session: String,
         server: ServerInfo,
         hmac: String,
+        /// Long-lived token the client should persist and use in future
+        /// `trusted_hello` messages — saves the user from scanning the QR
+        /// every time. Only present on a successful first-time Hello,
+        /// not on a TrustedHello reconnect (the client already has it).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        trust_token: Option<String>,
+        /// Stable identifier the server assigned to this device. The
+        /// client echoes it back in `trusted_hello.device_id` so the
+        /// server can look up the right token in O(1).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        device_id: Option<String>,
     },
     #[serde(rename = "error")]
     Error { code: ErrorCode, msg: String },
@@ -182,6 +207,14 @@ pub enum ErrorCode {
     CodeUsed,
     VersionMismatch,
     Malformed,
+    /// Reconnect path: device_id wasn't in `trusted_devices.json` (first
+    /// time on a new server, or the file was wiped). Phone should fall
+    /// back to QR pairing.
+    UnknownDevice,
+    /// Reconnect path: device_id known, but the supplied token didn't
+    /// match. Either the token was rotated/revoked or it's a malicious
+    /// client. Phone should clear its stored token and fall back to QR.
+    BadTrustToken,
     // M2
     StreamUnavailable,
     StreamAlreadyRunning,

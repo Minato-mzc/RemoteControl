@@ -24,9 +24,38 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::capture::DxgiCapture;
-use crate::encoder::{MediaFoundationH264Encoder, NvencMftEncoder};
+use crate::encoder::{MediaFoundationH264Encoder, NvencMftEncoder, NvencSdkEncoder};
 use crate::protocol::{build_audio_frame, build_video_frame, AudioMetadata};
 use crate::video::{EncodedPacket, EncoderConfig, H264Profile, VideoEncoder};
+
+/// Backend slot for the video worker. The SDK path drives both capture
+/// and encode through one zero-copy GPU pipeline (so it owns DxgiCapture
+/// itself); the trait-object path keeps capture and encode separate.
+enum EncoderSlot {
+    /// CPU-buffer path — `Box<dyn VideoEncoder>` consumes BGRA bytes from
+    /// `DxgiCapture::next_frame()`. Used by NVENC-via-MFT and MS software.
+    Cpu(Box<dyn VideoEncoder>, &'static str),
+    /// GPU zero-copy path — NVENC SDK direct integration (M4-B). Reads
+    /// the duplication frame straight into a registered D3D11 texture,
+    /// no CPU memcpy on the hot path.
+    GpuSdk(NvencSdkEncoder),
+}
+
+impl EncoderSlot {
+    fn name(&self) -> &str {
+        match self {
+            Self::Cpu(e, _) => e.name(),
+            Self::GpuSdk(e) => e.name(),
+        }
+    }
+
+    fn codec_wire(&self) -> &'static str {
+        match self {
+            Self::Cpu(_, w) => w,
+            Self::GpuSdk(_) => "h264",
+        }
+    }
+}
 
 #[cfg(windows)]
 use crate::audio::{
@@ -84,12 +113,35 @@ impl Drop for StreamHandle {
 
 pub fn start_stream(req: StreamRequestParams) -> Result<StreamHandle> {
     let cap = DxgiCapture::new()?;
-    let (width, height) = cap.dimensions();
+    let (cap_w, cap_h) = cap.dimensions();
+
+    // Plan A: encode at native capture resolution (1080p). The 720p
+    // downscale (Plan B) didn't deliver enough quality bump to offset
+    // the perceived sharpness loss on a phone screen — and at 30fps the
+    // 1660Ti has plenty of NVENC budget to encode 1080p with the
+    // bitrate we have, so 720p just gives up resolution for nothing.
+    let (width, height) = (cap_w, cap_h);
 
     let fps = req.max_fps.unwrap_or(60).clamp(15, 60);
     let bitrate_kbps = req.max_bitrate_kbps.unwrap_or(16_000).clamp(1_000, 50_000);
-    let kf_interval_ms = req.keyframe_interval_ms.unwrap_or(3_000).clamp(200, 10_000);
+    // 1s I-frame interval (was 3s). Empirically NVENC on this rig produces
+    // visible blocking/pixelation when motion suddenly appears: the encoder
+    // takes ~1s to ramp bitrate from idle (0.8Mbps) to motion (25-30Mbps),
+    // and any P-frame artifacts during ramp propagate until the next I-frame.
+    // GOP=fps gives the decoder a clean refresh every second — pixelation
+    // self-heals quickly instead of lingering for 3s. Bandwidth cost is
+    // small (I-frame ~3x P-frame, so ~1.7x average bitrate at 30Mbps cap).
+    let kf_interval_ms = req.keyframe_interval_ms.unwrap_or(1_000).clamp(200, 10_000);
     let keyframe_interval_frames = ((kf_interval_ms * fps) / 1000).max(1);
+
+    info!(
+        "stream: capture {}x{} → encode {}x{} (M4 720p downscale: {})",
+        cap_w,
+        cap_h,
+        width,
+        height,
+        width != cap_w || height != cap_h
+    );
 
     let cfg = EncoderConfig {
         width,
@@ -99,40 +151,65 @@ pub fn start_stream(req: StreamRequestParams) -> Result<StreamHandle> {
         keyframe_interval_frames,
         profile: H264Profile::High,
     };
-    // Try the requested codec on NVENC first. HEVC roughly halves the bitrate
-    // needed for the same quality, so it's the default for high-motion content.
-    // Fall back to H.264 NVENC, then to MS software H.264 if NVENC is missing.
-    let (encoder, codec_wire): (Box<dyn VideoEncoder>, &'static str) = match req.codec {
-        RequestedCodec::Hevc => match NvencMftEncoder::new_hevc(cfg) {
+    // Encoder fallback chain:
+    //   1. H.264 NVENC SDK (zero-copy GPU, ULTRA_LOW_LATENCY tuning) — only if
+    //      H.264 was requested. HEVC SDK path isn't wired yet.
+    //   2. NVENC via MFT (HEVC or H.264 depending on request) — uses the
+    //      same hardware engine but with MS's restrictive rate control.
+    //   3. MS software H.264 — universal fallback.
+    let encoder: EncoderSlot = match req.codec {
+        RequestedCodec::H264 => match NvencSdkEncoder::new(cfg, &cap) {
             Ok(e) => {
-                info!("video encoder: {}", e.name());
-                (Box::new(e), "hevc")
+                info!("video encoder: {} (NVENC SDK direct, GPU zero-copy)", e.name());
+                EncoderSlot::GpuSdk(e)
             }
-            Err(e) => {
-                warn!("NVENC HEVC unavailable ({e:#}); trying H.264 NVENC");
+            Err(sdk_err) => {
+                warn!("NVENC SDK direct unavailable ({sdk_err:#}); falling back to MFT");
                 match NvencMftEncoder::new(cfg) {
-                    Ok(e2) => {
-                        info!("video encoder: {}", e2.name());
-                        (Box::new(e2), "h264")
+                    Ok(e) => {
+                        info!("video encoder: {}", e.name());
+                        EncoderSlot::Cpu(Box::new(e), "h264")
                     }
-                    Err(e2) => {
-                        warn!("NVENC H.264 unavailable ({e2:#}); falling back to MS software");
-                        (Box::new(MediaFoundationH264Encoder::new(cfg)?), "h264")
+                    Err(e) => {
+                        warn!("NVENC H.264 MFT unavailable ({e:#}); using MS software");
+                        EncoderSlot::Cpu(
+                            Box::new(MediaFoundationH264Encoder::new(cfg)?),
+                            "h264",
+                        )
                     }
                 }
             }
         },
-        RequestedCodec::H264 => match NvencMftEncoder::new(cfg) {
+        RequestedCodec::Hevc => match NvencMftEncoder::new_hevc(cfg) {
             Ok(e) => {
                 info!("video encoder: {}", e.name());
-                (Box::new(e), "h264")
+                EncoderSlot::Cpu(Box::new(e), "hevc")
             }
             Err(e) => {
-                warn!("NVENC H.264 unavailable ({e:#}); falling back to MS software");
-                (Box::new(MediaFoundationH264Encoder::new(cfg)?), "h264")
+                warn!("NVENC HEVC unavailable ({e:#}); trying H.264 NVENC SDK");
+                match NvencSdkEncoder::new(cfg, &cap) {
+                    Ok(e2) => {
+                        info!("video encoder: {} (HEVC requested, fell back to H.264 SDK)", e2.name());
+                        EncoderSlot::GpuSdk(e2)
+                    }
+                    Err(_) => match NvencMftEncoder::new(cfg) {
+                        Ok(e2) => {
+                            info!("video encoder: {}", e2.name());
+                            EncoderSlot::Cpu(Box::new(e2), "h264")
+                        }
+                        Err(e2) => {
+                            warn!("NVENC H.264 unavailable ({e2:#}); using MS software");
+                            EncoderSlot::Cpu(
+                                Box::new(MediaFoundationH264Encoder::new(cfg)?),
+                                "h264",
+                            )
+                        }
+                    },
+                }
             }
         },
     };
+    let codec_wire = encoder.codec_wire();
 
     // Try to bring up audio. Failure here is non-fatal — fall back to video-only.
     #[cfg(windows)]
@@ -247,7 +324,7 @@ pub fn start_stream(req: StreamRequestParams) -> Result<StreamHandle> {
 
 fn run_video_loop(
     mut cap: DxgiCapture,
-    mut encoder: Box<dyn VideoEncoder>,
+    mut encoder: EncoderSlot,
     tx: mpsc::Sender<Vec<u8>>,
     force_kf: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -275,62 +352,101 @@ fn run_video_loop(
     let mut window_start = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
-        match cap.next_frame(100) {
-            Ok(None) => {
-                idle_strikes = idle_strikes.saturating_add(1);
-                if idle_strikes >= 30 {
-                    encoder.force_keyframe();
-                    idle_strikes = 0;
-                }
-                continue;
+        // Frame-pacing gate. Run-it-as-fast-as-possible doesn't help and
+        // wrecks rate control; we either wait or drop.
+        let now = Instant::now();
+        let _stale_pace = if now + early_margin < next_due {
+            // Sleep until next_due so we don't burn CPU polling capture.
+            let wait = (next_due - now).as_millis() as u64;
+            std::thread::sleep(Duration::from_millis(wait.min(20)));
+            continue;
+        } else {
+            ()
+        };
+
+        if force_kf.swap(false, Ordering::Relaxed) {
+            match &mut encoder {
+                EncoderSlot::Cpu(e, _) => e.force_keyframe(),
+                EncoderSlot::GpuSdk(e) => e.force_keyframe(),
             }
-            Ok(Some(frame)) => {
-                idle_strikes = 0;
-                let now = Instant::now();
-                if now + early_margin < next_due {
-                    // Too soon since last encoded frame — drop this capture.
-                    continue;
+        }
+
+        packets.clear();
+
+        let captured = match &mut encoder {
+            EncoderSlot::Cpu(e, _) => match cap.next_frame(100) {
+                Ok(None) => {
+                    idle_strikes = idle_strikes.saturating_add(1);
+                    if idle_strikes >= 30 {
+                        e.force_keyframe();
+                        idle_strikes = 0;
+                    }
+                    false
                 }
-                next_due = (next_due + frame_interval).max(now);
-                if force_kf.swap(false, Ordering::Relaxed) {
-                    encoder.force_keyframe();
+                Ok(Some(frame)) => {
+                    idle_strikes = 0;
+                    if let Err(err) = e.encode(&frame, &mut packets) {
+                        warn!("stream {stream_id} CPU encode error: {err:#} — stopping");
+                        break;
+                    }
+                    true
                 }
-                packets.clear();
-                if let Err(e) = encoder.encode(&frame, &mut packets) {
-                    warn!("stream {stream_id} encode error: {e:#} — stopping");
+                Err(err) => {
+                    warn!("stream {stream_id} capture error: {err:#} — stopping");
                     break;
                 }
-                for pkt in packets.drain(..) {
-                    let pts_us = (started_at.elapsed().as_micros())
-                        .min(u64::MAX as u128) as u64;
-                    bytes_in_window += pkt.data.len() as u64;
-                    frames_in_window += 1;
-                    let bin =
-                        build_video_frame(&pkt.data, pts_us, pkt.is_keyframe, pkt.has_config);
-                    if tx.blocking_send(bin).is_err() {
-                        info!("stream {stream_id} consumer gone; video exits");
-                        return;
+            },
+            EncoderSlot::GpuSdk(e) => match e.capture_and_encode(&mut cap, 100, &mut packets) {
+                Ok(0) => {
+                    idle_strikes = idle_strikes.saturating_add(1);
+                    if idle_strikes >= 30 {
+                        e.force_keyframe();
+                        idle_strikes = 0;
                     }
+                    false
                 }
-                if window_start.elapsed() >= Duration::from_secs(3) {
-                    let secs = window_start.elapsed().as_secs_f64();
-                    let mbps = (bytes_in_window * 8) as f64 / 1_000_000.0 / secs;
-                    info!(
-                        "video stats: {} frames / {:.1}s = {:.1} fps, {:.1} Mbps avg",
-                        frames_in_window,
-                        secs,
-                        frames_in_window as f64 / secs,
-                        mbps,
-                    );
-                    frames_in_window = 0;
-                    bytes_in_window = 0;
-                    window_start = Instant::now();
+                Ok(_n) => {
+                    idle_strikes = 0;
+                    true
                 }
+                Err(err) => {
+                    warn!("stream {stream_id} SDK encode error: {err:#} — stopping");
+                    break;
+                }
+            },
+        };
+
+        if captured {
+            // Successfully consumed one capture; advance pace clock.
+            next_due = (next_due + frame_interval).max(Instant::now());
+        } else {
+            continue;
+        }
+
+        for pkt in packets.drain(..) {
+            let pts_us = (started_at.elapsed().as_micros()).min(u64::MAX as u128) as u64;
+            bytes_in_window += pkt.data.len() as u64;
+            frames_in_window += 1;
+            let bin = build_video_frame(&pkt.data, pts_us, pkt.is_keyframe, pkt.has_config);
+            if tx.blocking_send(bin).is_err() {
+                info!("stream {stream_id} consumer gone; video exits");
+                return;
             }
-            Err(e) => {
-                warn!("stream {stream_id} capture error: {e:#} — stopping");
-                break;
-            }
+        }
+
+        if window_start.elapsed() >= Duration::from_secs(3) {
+            let secs = window_start.elapsed().as_secs_f64();
+            let mbps = (bytes_in_window * 8) as f64 / 1_000_000.0 / secs;
+            info!(
+                "video stats: {} frames / {:.1}s = {:.1} fps, {:.1} Mbps avg",
+                frames_in_window,
+                secs,
+                frames_in_window as f64 / secs,
+                mbps,
+            );
+            frames_in_window = 0;
+            bytes_in_window = 0;
+            window_start = Instant::now();
         }
     }
     info!("stream {stream_id} video loop exited");

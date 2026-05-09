@@ -13,7 +13,9 @@ pub mod net;
 pub mod pairing;
 pub mod protocol;
 pub mod qr;
+pub mod relay_client;
 pub mod stream;
+pub mod trusted_devices;
 pub mod video;
 pub mod ws_server;
 
@@ -62,5 +64,24 @@ pub async fn run_server() -> Result<()> {
         Err(e) => warn!("could not write QR HTML: {e:#}"),
     }
 
-    ws_server::run(primary.addr.to_string(), port, pairing, cfg).await
+    // Open the persistent device-trust store. Failure to load is not fatal
+    // (we just won't recognize previous reconnect tokens — first-time
+    // pairing via QR still works) so we log + continue with an empty
+    // store rather than aborting startup.
+    let trusted = match trusted_devices::TrustedDevicesStore::open_default() {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("trusted_devices store unavailable ({e:#}); starting with empty list");
+            // Fall back to a temp store that still serves the runtime API
+            // — verifies will all return UnknownDevice and the phone will
+            // re-pair via QR.
+            let tmp = std::env::temp_dir().join(format!(
+                "remotecontrol_trusted_{}.json",
+                uuid::Uuid::new_v4()
+            ));
+            trusted_devices::TrustedDevicesStore::open(tmp)?
+        }
+    };
+
+    ws_server::run(primary.addr.to_string(), port, pairing, trusted, cfg).await
 }

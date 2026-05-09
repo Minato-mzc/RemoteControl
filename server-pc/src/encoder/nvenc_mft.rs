@@ -25,7 +25,8 @@ use windows::core::{Interface, VARIANT};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
-use crate::encoder::common::bgra_to_nv12;
+use crate::encoder::common::frame_to_nv12;
+use crate::encoder::resize::BgraResizer;
 use crate::video::{
     CapturedFrame, EncodedPacket, EncoderConfig, H264Profile, PixelFormat, VideoEncoder,
 };
@@ -63,6 +64,9 @@ pub struct NvencMftEncoder {
     config: EncoderConfig,
     codec: NvencCodec,
     nv12: Vec<u8>,
+    /// Lazily initialized when the captured frame size doesn't match `config`.
+    resizer: Option<BgraResizer>,
+    resized_bgra: Vec<u8>,
     pending_inputs: VecDeque<IMFSample>,
     pending_keyframe: bool,
     output_provides_sample: bool,
@@ -131,10 +135,11 @@ impl NvencMftEncoder {
                     &CODECAPI_AVEncMPVGOPSize,
                     &VARIANT::from(config.keyframe_interval_frames),
                 );
-                // Enable 2 B frames between P frames. Earlier disabled for
-                // "low latency" but the resulting quality at 60fps wasn't
-                // worth it — B frames give a ~25% effective bitrate boost
-                // on motion-heavy content. Adds ~30ms latency, acceptable.
+                // 2 B frames. At 30fps the pipeline is well within NVENC's
+                // throughput budget, so B-frames give us their normal ~25%
+                // compression bonus → sharper picture at the same 30Mbps cap.
+                // (The 60fps tests where B>0 destabilized the pipeline are
+                // a separate problem that direct-NVENC-SDK will address.)
                 let _ = codec_api
                     .SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &VARIANT::from(2u32));
             }
@@ -186,6 +191,8 @@ impl NvencMftEncoder {
                 config,
                 codec,
                 nv12: vec![0u8; nv12_size],
+                resizer: None,
+                resized_bgra: Vec::new(),
                 pending_inputs: VecDeque::with_capacity(4),
                 pending_keyframe: true,
                 output_provides_sample,
@@ -265,23 +272,15 @@ impl VideoEncoder for NvencMftEncoder {
         if frame.format != PixelFormat::Bgra8 {
             bail!("nvenc MFT expects BGRA8 input (got {:?})", frame.format);
         }
-        if frame.width != self.config.width || frame.height != self.config.height {
-            bail!(
-                "encoder dimensions {}x{} but frame is {}x{}",
-                self.config.width,
-                self.config.height,
-                frame.width,
-                frame.height
-            );
-        }
 
-        bgra_to_nv12(
-            frame.pixels,
-            frame.stride as usize,
-            frame.width as usize,
-            frame.height as usize,
+        frame_to_nv12(
+            &mut self.resizer,
+            &mut self.resized_bgra,
+            frame,
+            self.config.width,
+            self.config.height,
             &mut self.nv12,
-        );
+        )?;
 
         unsafe {
             let buffer = MFCreateMemoryBuffer(self.nv12.len() as u32)

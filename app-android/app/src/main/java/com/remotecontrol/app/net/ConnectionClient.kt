@@ -67,6 +67,43 @@ class ConnectionClient(
     private var webSocket: WebSocket? = null
     private var pendingNonce: ByteArray = ByteArray(0)
     private var pendingKey: ByteArray = ByteArray(0)
+    /** Last URL we attempted to connect on — captured so [Listener] can
+     *  bundle it into [TrustedServer] when the welcome carries a fresh
+     *  trust_token, without re-parsing the URL out of okhttp. */
+    private var pendingWsUrl: String = ""
+
+    /** Set on [connect] (QR handshake path), null on [connectTrusted]
+     *  (trusted reconnect path). The [Listener] reads it in onOpen to
+     *  decide which payload to emit. */
+    private var pendingHello: HelloPayload? = null
+
+    /** When QR pairing succeeds and the Welcome carries a fresh
+     *  trust_token, we drop a [TrustedServer] here so the ViewModel can
+     *  persist it. We keep persistence out of the network layer because
+     *  it would force ConnectionClient to hold a Context. */
+    private val _newlyTrustedServer = MutableStateFlow<TrustedServer?>(null)
+    val newlyTrustedServer: StateFlow<TrustedServer?> = _newlyTrustedServer.asStateFlow()
+
+    /** Trusted reconnect was rejected (BadTrustToken / UnknownDevice). The
+     *  saved entry is stale — ViewModel listens here and removes it. */
+    private val _forgetDeviceId = MutableSharedFlow<String>(
+        replay = 0,
+        extraBufferCapacity = 1,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+    val forgetDeviceId: SharedFlow<String> = _forgetDeviceId.asSharedFlow()
+
+    /** Sealed payload picked at connect-time and consumed by Listener.onOpen. */
+    private sealed interface HelloPayload {
+        data class Qr(
+            val code: String,
+            val nonce: ByteArray,
+            val deviceName: String,
+        ) : HelloPayload
+
+        data class Trusted(val server: TrustedServer, val deviceName: String) :
+            HelloPayload
+    }
 
     fun connect(payload: QrPayload, deviceName: String = Build.MODEL ?: "Android") {
         disconnect()
@@ -76,9 +113,32 @@ class ConnectionClient(
         val nonce = ByteArray(16).also { SecureRandom().nextBytes(it) }
         pendingKey = key
         pendingNonce = nonce
+        pendingWsUrl = payload.wsUrl
+        pendingHello = HelloPayload.Qr(payload.code, nonce, deviceName)
 
         val req = Request.Builder().url(payload.wsUrl).build()
-        webSocket = http.newWebSocket(req, Listener(payload.code, nonce, deviceName))
+        webSocket = http.newWebSocket(req, Listener())
+    }
+
+    /**
+     * Fast-path reconnect against a previously-paired server. If the ws URL
+     * is unreachable (server moved subnets, PC offline) the listener
+     * surfaces a Failed state and the UI should fall back to QR scan.
+     */
+    fun connectTrusted(
+        server: TrustedServer,
+        deviceName: String = Build.MODEL ?: "Android",
+    ) {
+        disconnect()
+        _state.value = ConnectionState.Connecting
+
+        pendingKey = ByteArray(0)
+        pendingNonce = ByteArray(0)
+        pendingWsUrl = server.wsUrl
+        pendingHello = HelloPayload.Trusted(server, deviceName)
+
+        val req = Request.Builder().url(server.wsUrl).build()
+        webSocket = http.newWebSocket(req, Listener())
     }
 
     fun disconnect() {
@@ -90,6 +150,14 @@ class ConnectionClient(
     /** Ask the server to start a screen stream. Should be called after handshake completes. */
     fun requestStream(
         codec: String = "h264",
+        // Plan A: 30fps + 1080p + 30Mbps. After extensive testing of 60fps
+        // variants (1080p direct, 720p downscaled, VBR/CBR/AQ/multipass
+        // permutations), 60fps either showed mosaic on motion-heavy
+        // content (1660Ti throughput cap) or stuttered (WiFi backpressure
+        // at higher bitrates). 30fps + 1080p doubles the per-frame budget,
+        // gives full native resolution, and has been the only config to
+        // deliver clean playback through every combination tested. The
+        // tradeoff: cursor / scroll feel slightly choppier than 60fps.
         maxBitrateKbps: Int = 30_000,
         maxFps: Int = 30,
     ) {
@@ -98,9 +166,13 @@ class ConnectionClient(
             codec = codec,
             maxBitrateKbps = maxBitrateKbps,
             maxFps = maxFps,
-            // 3s GOP — fewer IDR frames means more bits go to P frames,
-            // helping motion-heavy content (videos, scrolling) stay sharp.
-            preferKeyframeIntervalMs = 3000,
+            // 1s GOP. NVENC on this rig takes ~1s to ramp bitrate from idle
+            // (0.8Mbps) up to motion (25-30Mbps); any P-frame artifacts during
+            // that ramp would persist for the whole GOP. With GOP=fps every
+            // second of streaming gets a clean refresh, so visible
+            // pixelation/blocking self-heals quickly. Bandwidth cost is
+            // small (one extra IDR/sec ≈ +20% size vs P-only).
+            preferKeyframeIntervalMs = 1000,
         )
         ws.send(ProtoJson.encodeToString(ClientMsg.serializer(), msg))
     }
@@ -179,24 +251,38 @@ class ConnectionClient(
     )
     val clipboardFromPc: SharedFlow<String> = _clipboardFromPc.asSharedFlow()
 
-    private inner class Listener(
-        private val pairingCode: String,
-        private val nonce: ByteArray,
-        private val deviceName: String,
-    ) : WebSocketListener() {
+    private inner class Listener : WebSocketListener() {
 
         override fun onOpen(ws: WebSocket, response: Response) {
             Log.i(TAG, "opened ${response.request.url}")
-            val hello = Hello(
-                c = pairingCode,
-                nonce = base64Url(nonce),
-                client = ClientInfo(
-                    name = deviceName,
-                    os = "HarmonyOS/Android API ${Build.VERSION.SDK_INT}",
-                    appVersion = "0.1.0",
-                ),
-            )
-            ws.send(ProtoJson.encodeToString(ClientMsg.serializer(), hello))
+            val helloPayload = pendingHello
+            val msg: ClientMsg = when (helloPayload) {
+                is HelloPayload.Qr -> Hello(
+                    c = helloPayload.code,
+                    nonce = base64Url(helloPayload.nonce),
+                    client = ClientInfo(
+                        name = helloPayload.deviceName,
+                        os = "HarmonyOS/Android API ${Build.VERSION.SDK_INT}",
+                        appVersion = "0.1.0",
+                    ),
+                )
+                is HelloPayload.Trusted -> TrustedHello(
+                    deviceId = helloPayload.server.deviceId,
+                    token = helloPayload.server.token,
+                    client = ClientInfo(
+                        name = helloPayload.deviceName,
+                        os = "HarmonyOS/Android API ${Build.VERSION.SDK_INT}",
+                        appVersion = "0.1.0",
+                    ),
+                )
+                null -> {
+                    // Race: connect() got cancelled between newWebSocket and
+                    // onOpen. Just close.
+                    ws.close(1001, "no_pending_hello")
+                    return
+                }
+            }
+            ws.send(ProtoJson.encodeToString(ClientMsg.serializer(), msg))
         }
 
         override fun onMessage(ws: WebSocket, text: String) {
@@ -212,6 +298,15 @@ class ConnectionClient(
                 is Welcome -> handleWelcome(msg, ws)
                 is ServerError -> {
                     Log.w(TAG, "server error ${msg.code}: ${msg.msg}")
+                    // Trusted-reconnect rejection → tell the ViewModel to
+                    // forget the saved entry. The server's view of trust is
+                    // authoritative; if it doesn't recognize us, our token
+                    // is stale.
+                    if (msg.code == "bad_trust_token" || msg.code == "unknown_device") {
+                        (pendingHello as? HelloPayload.Trusted)?.let {
+                            _forgetDeviceId.tryEmit(it.server.deviceId)
+                        }
+                    }
                     _state.value = ConnectionState.Failed(mapErrorCode(msg.code, msg.msg))
                     ws.close(1000, "rejected")
                 }
@@ -263,12 +358,31 @@ class ConnectionClient(
     }
 
     private fun handleWelcome(welcome: Welcome, ws: WebSocket) {
-        val expected = hmacSha256Hex(pendingKey, pendingNonce)
-        if (!constantTimeEquals(expected, welcome.hmac)) {
-            Log.w(TAG, "HMAC mismatch — possible man-in-the-middle")
-            _state.value = ConnectionState.Failed("服务器身份验证失败（HMAC 不匹配）")
-            ws.close(1008, "hmac_mismatch")
-            return
+        // QR-pairing path: server proves it knows the key by HMAC-ing our
+        // nonce. Trusted-reconnect path: pendingKey is empty, server's HMAC
+        // field is empty too — the trust token itself was the proof.
+        val isTrustedReconnect = pendingKey.isEmpty() && pendingNonce.isEmpty()
+        if (!isTrustedReconnect) {
+            val expected = hmacSha256Hex(pendingKey, pendingNonce)
+            if (!constantTimeEquals(expected, welcome.hmac)) {
+                Log.w(TAG, "HMAC mismatch — possible man-in-the-middle")
+                _state.value = ConnectionState.Failed("服务器身份验证失败（HMAC 不匹配）")
+                ws.close(1008, "hmac_mismatch")
+                return
+            }
+        }
+        // Hand the new token (if any) up to the ViewModel for persistence.
+        // Only fires on the QR path — trusted reconnects don't reissue.
+        val token = welcome.trustToken
+        val deviceId = welcome.deviceId
+        if (token != null && deviceId != null) {
+            _newlyTrustedServer.value = TrustedServer(
+                deviceId = deviceId,
+                token = token,
+                wsUrl = pendingWsUrl,
+                serverName = welcome.server.name,
+                lastConnectedMs = System.currentTimeMillis(),
+            )
         }
         _state.value = ConnectionState.Connected(
             serverName = welcome.server.name,
@@ -322,6 +436,8 @@ class ConnectionClient(
         "stream_unavailable" -> "屏幕串流不可用：$msg"
         "stream_already_running" -> "已有活跃的串流"
         "not_authenticated" -> "未握手，请先重新连接"
+        "unknown_device" -> "服务器不认识本设备，请重新扫码配对"
+        "bad_trust_token" -> "信任凭证已失效，请重新扫码配对"
         else -> "$code: $msg"
     }
 

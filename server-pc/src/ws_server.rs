@@ -28,24 +28,33 @@ use crate::input;
 use crate::pairing::{PairingStore, VerifyResult};
 use crate::protocol::{ClientMsg, ErrorCode, ServerInfo, ServerMsg, StreamStopReason};
 use crate::stream::{start_stream, RequestedCodec, StreamHandle, StreamRequestParams};
+use crate::trusted_devices::{TrustedDevicesStore, VerifyOutcome};
 
 type HmacSha256 = Hmac<Sha256>;
 type WsSink = SplitSink<WebSocketStream<TcpStream>, Message>;
 
-pub async fn run(host: String, port: u16, pairing: PairingStore, cfg: Config) -> Result<()> {
+pub async fn run(
+    host: String,
+    port: u16,
+    pairing: PairingStore,
+    trusted: TrustedDevicesStore,
+    cfg: Config,
+) -> Result<()> {
     let bind = format!("0.0.0.0:{port}");
     let listener = TcpListener::bind(&bind).await?;
     info!("WebSocket listening on {bind} (advertised as {host}:{port})");
 
     let pairing = Arc::new(pairing);
+    let trusted = Arc::new(trusted);
     let cfg = Arc::new(cfg);
 
     loop {
         let (tcp, peer) = listener.accept().await?;
         let pairing = pairing.clone();
+        let trusted = trusted.clone();
         let cfg = cfg.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(tcp, peer, pairing, cfg).await {
+            if let Err(e) = handle_connection(tcp, peer, pairing, trusted, cfg).await {
                 warn!("connection from {peer} ended: {e:#}");
             }
         });
@@ -56,6 +65,7 @@ async fn handle_connection(
     tcp: TcpStream,
     peer: std::net::SocketAddr,
     pairing: Arc<PairingStore>,
+    trusted: Arc<TrustedDevicesStore>,
     cfg: Arc<Config>,
 ) -> Result<()> {
     let ws = accept_async(tcp).await?;
@@ -92,7 +102,7 @@ async fn handle_connection(
                             }
                             Ok(parsed) => {
                                 let cont = handle_client_msg(
-                                    parsed, peer, &pairing, &cfg,
+                                    parsed, peer, &pairing, &trusted, &cfg,
                                     &mut authenticated, &mut active_stream,
                                     &mut sink,
                                 ).await?;
@@ -141,6 +151,7 @@ async fn handle_client_msg(
     msg: ClientMsg,
     peer: std::net::SocketAddr,
     pairing: &PairingStore,
+    trusted: &TrustedDevicesStore,
     cfg: &Config,
     authenticated: &mut bool,
     active_stream: &mut Option<StreamHandle>,
@@ -175,6 +186,23 @@ async fn handle_client_msg(
                     let hmac_hex = hex_encode(&mac.finalize().into_bytes());
 
                     let session = uuid::Uuid::new_v4().to_string();
+                    // Mint a long-lived trust token so the phone doesn't have to
+                    // scan a QR every time. Failure here is non-fatal — the
+                    // pairing succeeded, we just won't enable seamless
+                    // reconnect for this device. Phone falls back to QR.
+                    let (trust_token, device_id) = match trusted.mint(client.name.clone()) {
+                        Ok((dev_id, token)) => {
+                            info!(
+                                "minted trust token  device_id={dev_id}  device_name={:?}",
+                                client.name
+                            );
+                            (Some(token), Some(dev_id))
+                        }
+                        Err(e) => {
+                            warn!("trusted_devices.mint failed: {e:#}");
+                            (None, None)
+                        }
+                    };
                     info!(
                         "handshake OK  peer={peer} session={session} client={:?}",
                         client
@@ -189,6 +217,8 @@ async fn handle_client_msg(
                                 version: SERVER_VERSION.to_string(),
                             },
                             hmac: hmac_hex,
+                            trust_token,
+                            device_id,
                         },
                     )
                     .await?;
@@ -204,6 +234,73 @@ async fn handle_client_msg(
                 }
                 VerifyResult::Used => {
                     send_error(sink, ErrorCode::CodeUsed, "code already used").await?;
+                    return Ok(false);
+                }
+            }
+        }
+
+        ClientMsg::TrustedHello {
+            v,
+            device_id,
+            token,
+            client,
+        } => {
+            if !(MIN_SUPPORTED_VERSION..=PROTOCOL_VERSION).contains(&v) {
+                send_error(
+                    sink,
+                    ErrorCode::VersionMismatch,
+                    &format!(
+                        "server accepts v={MIN_SUPPORTED_VERSION}..={PROTOCOL_VERSION}, got v={v}"
+                    ),
+                )
+                .await?;
+                return Ok(false);
+            }
+            match trusted.verify(&device_id, &token) {
+                Ok(VerifyOutcome::Ok { device_name }) => {
+                    let session = uuid::Uuid::new_v4().to_string();
+                    info!(
+                        "trusted reconnect OK  peer={peer} session={session}  device={device_name:?} (id={device_id}) client={:?}",
+                        client
+                    );
+                    send(
+                        sink,
+                        ServerMsg::Welcome {
+                            session,
+                            server: ServerInfo {
+                                name: cfg.server_name.clone(),
+                                os: cfg.os.clone(),
+                                version: SERVER_VERSION.to_string(),
+                            },
+                            // No HMAC challenge for trusted reconnect — the
+                            // token itself is the authentication factor. The
+                            // field stays in the schema for QR-path callers.
+                            hmac: String::new(),
+                            // Don't re-issue. Phone keeps the same token.
+                            trust_token: None,
+                            device_id: None,
+                        },
+                    )
+                    .await?;
+                    *authenticated = true;
+                }
+                Ok(VerifyOutcome::UnknownDevice) => {
+                    info!(
+                        "trusted reconnect rejected (unknown device_id={device_id}) peer={peer}"
+                    );
+                    send_error(sink, ErrorCode::UnknownDevice, "device not trusted; please re-pair via QR").await?;
+                    return Ok(false);
+                }
+                Ok(VerifyOutcome::BadToken) => {
+                    warn!(
+                        "trusted reconnect rejected (bad token for device_id={device_id}) peer={peer}"
+                    );
+                    send_error(sink, ErrorCode::BadTrustToken, "trust token mismatch").await?;
+                    return Ok(false);
+                }
+                Err(e) => {
+                    warn!("trusted_devices.verify error: {e:#}");
+                    send_error(sink, ErrorCode::Malformed, "internal trust check failed").await?;
                     return Ok(false);
                 }
             }

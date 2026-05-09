@@ -48,8 +48,23 @@ pub fn save_qr_html_and_open(
         anyhow::bail!("no LAN address candidates");
     }
 
+    // Drop virtual / Hyper-V switch interfaces from the HTML — phones can't
+    // route to them, so showing a QR card just creates noise. We still log
+    // them in `lib.rs` for debugging, just don't print a QR. If everything
+    // got filtered out (no physical NIC), fall back to the full list so
+    // the user at least has *something* to scan.
+    let physical: Vec<&DiscoveredAddr> = addrs
+        .iter()
+        .filter(|a| a.kind != InterfaceKind::Virtual)
+        .collect();
+    let visible: Vec<&DiscoveredAddr> = if physical.is_empty() {
+        addrs.iter().collect()
+    } else {
+        physical
+    };
+
     let mut tiles = String::new();
-    for a in addrs {
+    for a in visible {
         let payload = build_payload(&a.addr.to_string(), port, code, key_b64url);
         let qr = QrCode::new(payload.as_bytes()).context("build QR")?;
         let svg_xml = qr

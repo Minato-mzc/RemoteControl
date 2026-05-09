@@ -55,6 +55,8 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.remotecontrol.app.net.Macro
+import com.remotecontrol.app.net.Macros
 import com.remotecontrol.app.net.VKey
 
 /**
@@ -74,6 +76,7 @@ fun KeyboardOverlay(
     onKeyTap: (vk: Int) -> Unit,
     onClipboardPush: (String) -> Unit,
     onClipboardPull: () -> Unit,
+    onMacro: (Macro) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var expanded by remember { mutableStateOf(false) }
@@ -106,6 +109,7 @@ fun KeyboardOverlay(
                 onKeyTap = onKeyTap,
                 onClipboardPush = onClipboardPush,
                 onClipboardPull = onClipboardPull,
+                onMacro = onMacro,
                 onClose = { expanded = false },
                 modifier = Modifier.align(Alignment.BottomCenter),
             )
@@ -120,6 +124,7 @@ private fun ExpandedPanel(
     onKeyTap: (vk: Int) -> Unit,
     onClipboardPush: (String) -> Unit,
     onClipboardPull: () -> Unit,
+    onMacro: (Macro) -> Unit,
     onClose: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -183,6 +188,19 @@ private fun ExpandedPanel(
                 }
             }
             KIcon(Icons.Default.ContentPaste) { onClipboardPull() }
+        }
+
+        // Macro row: common Windows shortcuts in one tap.
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            for (macro in Macros.DEFAULTS) {
+                KKey(macro.label) { onMacro(macro) }
+            }
         }
     }
 }

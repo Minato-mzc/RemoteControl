@@ -1,0 +1,20 @@
+# Top-level workspace ties the PC server and the cross-network relay
+# together so they share a single Cargo.lock + target/ — easier to keep
+# their wire-protocol crates in lockstep when we evolve them.
+#
+# Members:
+#   - server-pc : Windows host that captures + encodes + serves
+#   - relay     : Linux daemon (deployed on a public VPS) that brokers
+#                 phone↔PC sessions when they're on different networks
+[workspace]
+members = ["server-pc", "relay"]
+resolver = "2"
+
+# Release profile applies to every binary in the workspace. The PC server
+# benefits from -O3 + thin LTO (encoder hot path) and the relay is small
+# enough that the compile-time cost is invisible.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -29,6 +29,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.remotecontrol.app.model.ActiveStream
 import com.remotecontrol.app.model.AudioStreamInfo
 import com.remotecontrol.app.net.AudioFrame
+import com.remotecontrol.app.net.Macro
 import com.remotecontrol.app.net.MouseBtn
 import com.remotecontrol.app.net.VideoFrame
 import com.remotecontrol.app.video.H264Player
@@ -45,6 +46,7 @@ data class InputCallbacks(
     val onKeyTap: (vk: Int) -> Unit = {},
     val onClipboardPush: (String) -> Unit = {},
     val onClipboardPull: () -> Unit = {},
+    val onMacro: (Macro) -> Unit = {},
 )
 
 @Composable

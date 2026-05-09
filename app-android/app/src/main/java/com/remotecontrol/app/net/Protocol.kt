@@ -27,6 +27,22 @@ data class Hello(
     val client: ClientInfo,
 ) : ClientMsg
 
+/**
+ * Skip-the-QR reconnect handshake. Sent in place of [Hello] when we
+ * already have a `(deviceId, token)` minted from a previous successful
+ * pairing on this server. Server verifies against its trusted-devices
+ * file; on match we get back the same Welcome shape (minus the new
+ * trust_token / device_id fields, which we're already holding).
+ */
+@Serializable
+@SerialName("trusted_hello")
+data class TrustedHello(
+    val v: Int = PROTOCOL_VERSION,
+    @SerialName("device_id") val deviceId: String,
+    val token: String,
+    val client: ClientInfo,
+) : ClientMsg
+
 @Serializable
 @SerialName("ping")
 data class Ping(val ts: Long) : ClientMsg
@@ -110,7 +126,47 @@ object VKey {
     const val NEXT = 0x22 // PageDown
     const val SNAPSHOT = 0x2C // PrtSc
     const val LWIN = 0x5B
+    const val CONTROL = 0x11
+    const val MENU = 0x12 // Alt
+    const val SHIFT = 0x10
+    const val DELETE = 0x2E
     fun f(n: Int): Int = 0x70 + (n - 1) // F1=0x70 ... F12=0x7B
+    /** Letter VK code: 'A' (0x41) ... 'Z' (0x5A). Pass uppercase ASCII. */
+    fun letter(c: Char): Int = c.uppercaseChar().code
+}
+
+/** Steps inside a [Macro], played sequentially on the server. */
+sealed interface MacroStep {
+    data class KeyDown(val vk: Int) : MacroStep
+    data class KeyUp(val vk: Int) : MacroStep
+    /** Convenience: down + up. */
+    data class KeyTap(val vk: Int) : MacroStep
+    /** Inter-step delay so the PC OS observes events as separate keystrokes. */
+    data class Delay(val ms: Long) : MacroStep
+}
+
+data class Macro(val label: String, val steps: List<MacroStep>)
+
+/** Built-in shortcut macros (M7 v1). User-defined macros come later. */
+object Macros {
+    private fun combo(modifier: Int, vk: Int) = listOf(
+        MacroStep.KeyDown(modifier),
+        MacroStep.Delay(8),
+        MacroStep.KeyTap(vk),
+        MacroStep.Delay(8),
+        MacroStep.KeyUp(modifier),
+    )
+
+    val CTRL_C = Macro("Ctrl+C", combo(VKey.CONTROL, VKey.letter('C')))
+    val CTRL_V = Macro("Ctrl+V", combo(VKey.CONTROL, VKey.letter('V')))
+    val CTRL_X = Macro("Ctrl+X", combo(VKey.CONTROL, VKey.letter('X')))
+    val CTRL_A = Macro("Ctrl+A", combo(VKey.CONTROL, VKey.letter('A')))
+    val CTRL_Z = Macro("Ctrl+Z", combo(VKey.CONTROL, VKey.letter('Z')))
+    val ALT_TAB = Macro("Alt+Tab", combo(VKey.MENU, VKey.TAB))
+    val WIN_R = Macro("Win+R", combo(VKey.LWIN, VKey.letter('R')))
+    val WIN_D = Macro("Win+D", combo(VKey.LWIN, VKey.letter('D')))
+
+    val DEFAULTS: List<Macro> = listOf(CTRL_C, CTRL_V, CTRL_X, CTRL_A, CTRL_Z, ALT_TAB, WIN_R, WIN_D)
 }
 
 @Serializable
@@ -131,6 +187,13 @@ data class Welcome(
     val session: String,
     val server: ServerInfo,
     val hmac: String,
+    /** Long-lived token to persist for [TrustedHello] reconnects. Null
+     *  when this Welcome is itself the response to a TrustedHello (the
+     *  client already has the token). */
+    @SerialName("trust_token") val trustToken: String? = null,
+    /** Stable id the server assigned to this device. Echo back in
+     *  [TrustedHello.deviceId]. Null on TrustedHello replies. */
+    @SerialName("device_id") val deviceId: String? = null,
 ) : ServerMsg
 
 @Serializable

@@ -28,6 +28,7 @@ class MainActivity : ComponentActivity() {
                 Surface(modifier = Modifier, color = MaterialTheme.colorScheme.background) {
                     val state by vm.connectionState.collectAsStateSafely()
                     val framesReceived by vm.framesReceived.collectAsStateSafely()
+                    val trustedServers by vm.trustedServers.collectAsStateSafely()
                     val input = remember(vm) {
                         InputCallbacks(
                             onMove = vm::sendMouseMove,
@@ -37,6 +38,7 @@ class MainActivity : ComponentActivity() {
                             onKeyTap = vm::sendKeyTap,
                             onClipboardPush = vm::sendClipboardSet,
                             onClipboardPull = vm::sendClipboardGet,
+                            onMacro = vm::runMacro,
                         )
                     }
                     AppNav(
@@ -46,7 +48,10 @@ class MainActivity : ComponentActivity() {
                         clipboardFromPc = vm.clipboardFromPc,
                         framesReceived = framesReceived,
                         input = input,
+                        trustedServers = trustedServers,
                         onScanResult = vm::onQrScanned,
+                        onReconnect = vm::reconnectTrusted,
+                        onForgetTrusted = vm::forgetTrustedServer,
                         onDisconnect = vm::disconnect,
                         onResetError = vm::resetError,
                     )

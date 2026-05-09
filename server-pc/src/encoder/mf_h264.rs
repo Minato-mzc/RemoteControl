@@ -20,7 +20,8 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
 
-use crate::encoder::common::bgra_to_nv12;
+use crate::encoder::common::frame_to_nv12;
+use crate::encoder::resize::BgraResizer;
 use crate::video::{
     CapturedFrame, EncodedPacket, EncoderConfig, H264Profile, PixelFormat, VideoEncoder,
 };
@@ -33,6 +34,8 @@ pub struct MediaFoundationH264Encoder {
     transform: IMFTransform,
     config: EncoderConfig,
     nv12: Vec<u8>,
+    resizer: Option<BgraResizer>,
+    resized_bgra: Vec<u8>,
     pending_keyframe: bool,
     output_provides_sample: bool,
     sample_alloc_size: u32,
@@ -110,6 +113,8 @@ impl MediaFoundationH264Encoder {
                 transform,
                 config,
                 nv12: vec![0u8; nv12_size],
+                resizer: None,
+                resized_bgra: Vec::new(),
                 pending_keyframe: true, // first frame must be IDR
                 output_provides_sample,
                 sample_alloc_size,
@@ -166,20 +171,15 @@ impl VideoEncoder for MediaFoundationH264Encoder {
         if frame.format != PixelFormat::Bgra8 {
             bail!("MF H264 encoder expects BGRA8 input (got {:?})", frame.format);
         }
-        if frame.width != self.config.width || frame.height != self.config.height {
-            bail!(
-                "encoder dimensions {}x{} but frame is {}x{} — dynamic resize not implemented",
-                self.config.width, self.config.height, frame.width, frame.height
-            );
-        }
 
-        bgra_to_nv12(
-            frame.pixels,
-            frame.stride as usize,
-            frame.width as usize,
-            frame.height as usize,
+        frame_to_nv12(
+            &mut self.resizer,
+            &mut self.resized_bgra,
+            frame,
+            self.config.width,
+            self.config.height,
             &mut self.nv12,
-        );
+        )?;
 
         unsafe {
             let buffer = MFCreateMemoryBuffer(self.nv12.len() as u32)

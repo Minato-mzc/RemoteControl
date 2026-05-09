@@ -1,5 +1,55 @@
 //! Helpers shared across H.264 encoder backends.
 
+use anyhow::Result;
+
+use crate::encoder::resize::BgraResizer;
+use crate::video::CapturedFrame;
+
+/// Convert a captured BGRA frame into NV12 sized to the encoder's target,
+/// resizing first if the captured size doesn't match. The resizer is created
+/// on first call (when we learn the source dimensions).
+pub fn frame_to_nv12(
+    resizer: &mut Option<BgraResizer>,
+    resized_bgra: &mut Vec<u8>,
+    frame: &CapturedFrame,
+    target_w: u32,
+    target_h: u32,
+    nv12_out: &mut [u8],
+) -> Result<()> {
+    if frame.width == target_w && frame.height == target_h {
+        bgra_to_nv12(
+            frame.pixels,
+            frame.stride as usize,
+            target_w as usize,
+            target_h as usize,
+            nv12_out,
+        );
+    } else {
+        let r = match resizer {
+            Some(r) => r,
+            None => {
+                *resizer = Some(BgraResizer::new(frame.width, frame.height));
+                resizer.as_mut().unwrap()
+            }
+        };
+        r.resize_into(
+            frame.pixels,
+            frame.stride as usize,
+            target_w,
+            target_h,
+            resized_bgra,
+        )?;
+        bgra_to_nv12(
+            resized_bgra,
+            target_w as usize * 4,
+            target_w as usize,
+            target_h as usize,
+            nv12_out,
+        );
+    }
+    Ok(())
+}
+
 /// CPU BGRA → NV12 (BT.601 limited range). Not SIMD; ~5–8% of one core at
 /// 1080p60 on a modern desktop. `out` MUST be sized `w * h * 3 / 2`.
 pub fn bgra_to_nv12(bgra: &[u8], stride: usize, w: usize, h: usize, out: &mut [u8]) {

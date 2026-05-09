@@ -1,0 +1,31 @@
+[package]
+name = "remotecontrol-relay"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-network broker between RemoteControl PC server and phone clients"
+
+[[bin]]
+name = "remotecontrol-relay"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+# Web framework. Picked over `warp` because axum's WebSocket extractor is
+# nicer to compose with custom auth middleware, and we get to share the
+# same tokio_tungstenite-style API the server-pc side already uses.
+axum = { version = "0.7", features = ["ws", "macros"] }
+
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+rand = "0.8"
+base64 = "0.22"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+
+clap = { version = "4", features = ["derive"] }

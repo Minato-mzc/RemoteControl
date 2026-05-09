@@ -11,11 +11,16 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material3.Button
@@ -37,6 +42,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.remotecontrol.app.model.ConnectionState
 import com.remotecontrol.app.net.AudioFrame
+import com.remotecontrol.app.net.TrustedServer
 import com.remotecontrol.app.net.VideoFrame
 import kotlinx.coroutines.flow.SharedFlow
 
@@ -48,7 +54,10 @@ fun MainScreen(
     clipboardFromPc: SharedFlow<String>,
     framesReceived: Long,
     input: InputCallbacks,
+    trustedServers: List<TrustedServer>,
     onScanClick: () -> Unit,
+    onReconnect: (TrustedServer) -> Unit,
+    onForgetTrusted: (String) -> Unit,
     onDisconnect: () -> Unit,
     onResetError: () -> Unit,
 ) {
@@ -68,9 +77,20 @@ fun MainScreen(
             Header()
             Spacer(Modifier.height(40.dp))
             when (state) {
-                is ConnectionState.Idle -> IdleBlock(onScanClick)
+                is ConnectionState.Idle -> IdleBlock(
+                    trustedServers = trustedServers,
+                    onScanClick = onScanClick,
+                    onReconnect = onReconnect,
+                    onForget = onForgetTrusted,
+                )
                 is ConnectionState.Connecting -> ConnectingBlock()
-                is ConnectionState.Failed -> FailedBlock(state.reason, onResetError, onScanClick)
+                is ConnectionState.Failed -> FailedBlock(
+                    reason = state.reason,
+                    trustedServers = trustedServers,
+                    onResetError = onResetError,
+                    onScanClick = onScanClick,
+                    onReconnect = onReconnect,
+                )
                 is ConnectionState.Connected -> Unit // unreachable
             }
         }
@@ -174,6 +194,7 @@ private fun ConnectedScreen(
                 onKeyTap = input.onKeyTap,
                 onClipboardPush = input.onClipboardPush,
                 onClipboardPull = input.onClipboardPull,
+                onMacro = input.onMacro,
                 modifier = Modifier.fillMaxSize(),
             )
 
@@ -222,13 +243,80 @@ private fun Header() {
 }
 
 @Composable
-private fun IdleBlock(onScanClick: () -> Unit) {
+private fun IdleBlock(
+    trustedServers: List<TrustedServer>,
+    onScanClick: () -> Unit,
+    onReconnect: (TrustedServer) -> Unit,
+    onForget: (String) -> Unit,
+) {
     Text("未连接", fontSize = 16.sp)
     Spacer(Modifier.height(24.dp))
+    if (trustedServers.isNotEmpty()) {
+        TrustedServersList(
+            servers = trustedServers,
+            onReconnect = onReconnect,
+            onForget = onForget,
+        )
+        Spacer(Modifier.height(20.dp))
+        Text("或者", fontSize = 13.sp, color = Color(0xFF888888))
+        Spacer(Modifier.height(12.dp))
+    }
     Button(onClick = onScanClick) {
         Icon(Icons.Default.QrCodeScanner, contentDescription = null)
         Spacer(Modifier.size(8.dp))
-        Text("扫码连接电脑")
+        Text(if (trustedServers.isEmpty()) "扫码连接电脑" else "扫描新二维码")
+    }
+}
+
+/**
+ * Vertical list of "Reconnect to PCNAME" rows. Each row has a primary
+ * action (left tap = reconnect) and a small × button (right tap = forget,
+ * for when a saved server is permanently gone or you re-installed Windows
+ * and the server-side trusted_devices.json wiped).
+ */
+@Composable
+private fun TrustedServersList(
+    servers: List<TrustedServer>,
+    onReconnect: (TrustedServer) -> Unit,
+    onForget: (String) -> Unit,
+) {
+    Column(modifier = Modifier.padding(horizontal = 12.dp)) {
+        Text(
+            "已配对的电脑",
+            fontSize = 13.sp,
+            color = Color(0xFF666666),
+            modifier = Modifier.padding(start = 4.dp, bottom = 6.dp),
+        )
+        for (server in servers) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Button(
+                    onClick = { onReconnect(server) },
+                    modifier = Modifier.fillMaxWidth().weight(1f),
+                ) {
+                    Icon(Icons.Default.History, contentDescription = null)
+                    Spacer(Modifier.size(8.dp))
+                    Text(
+                        "重新连接 ${server.serverName.ifEmpty { "电脑" }}",
+                    )
+                }
+                Spacer(Modifier.width(6.dp))
+                OutlinedButton(
+                    onClick = { onForget(server.deviceId) },
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(8.dp),
+                    modifier = Modifier.size(48.dp),
+                ) {
+                    Icon(
+                        Icons.Default.Close,
+                        contentDescription = "忘记 ${server.serverName}",
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -240,12 +328,37 @@ private fun ConnectingBlock() {
 }
 
 @Composable
-private fun FailedBlock(reason: String, onResetError: () -> Unit, onScanClick: () -> Unit) {
+private fun FailedBlock(
+    reason: String,
+    trustedServers: List<TrustedServer>,
+    onResetError: () -> Unit,
+    onScanClick: () -> Unit,
+    onReconnect: (TrustedServer) -> Unit,
+) {
     Text("连接失败", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
     Spacer(Modifier.height(12.dp))
     Text(reason)
     Spacer(Modifier.height(24.dp))
-    Button(onClick = {
+    // If trusted servers exist, offer them as the primary recovery path —
+    // the user is much more likely to retry the same PC than to give up.
+    // Falling back to the QR scanner always remains available below.
+    if (trustedServers.isNotEmpty()) {
+        for (server in trustedServers) {
+            Button(
+                onClick = {
+                    onResetError()
+                    onReconnect(server)
+                },
+                modifier = Modifier.padding(vertical = 4.dp),
+            ) {
+                Icon(Icons.Default.History, contentDescription = null)
+                Spacer(Modifier.size(8.dp))
+                Text("重试 ${server.serverName.ifEmpty { "电脑" }}")
+            }
+        }
+        Spacer(Modifier.height(12.dp))
+    }
+    OutlinedButton(onClick = {
         onResetError()
         onScanClick()
     }) { Text("重新扫码") }

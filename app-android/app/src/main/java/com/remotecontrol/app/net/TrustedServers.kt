@@ -1,0 +1,90 @@
+package com.remotecontrol.app.net
+
+import android.content.Context
+import androidx.core.content.edit
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.json.Json
+
+/**
+ * A previously-paired server we can reconnect to without scanning a QR.
+ *
+ * After the first successful [Hello] handshake, the server hands back a
+ * `device_id` + 256-bit `trust_token` in [Welcome]. We persist them here,
+ * tagged with the `wsUrl` we connected to last time, so the next app
+ * launch can skip straight to a [TrustedHello] reconnect.
+ */
+@Serializable
+data class TrustedServer(
+    val deviceId: String,
+    val token: String,
+    /** Last `ws://host:port` we successfully connected on. The server's
+     *  IP can change between Wi-Fi sessions — if this URL stops working
+     *  the UI falls back to QR scan. */
+    val wsUrl: String,
+    /** Display name from `Welcome.server.name` ("ADMIN", etc.). */
+    val serverName: String,
+    /** Wall-clock millis of last successful connection — for sorting and
+     *  for showing "上次连接 X 分钟前" later. */
+    val lastConnectedMs: Long,
+)
+
+/**
+ * SharedPreferences-backed store of trusted servers. Persistent across
+ * app restarts, app updates, and device reboots; cleared on app data
+ * wipe. Synchronously read/written — the dataset is tiny (one entry per
+ * paired PC) so no async wrapper.
+ */
+class TrustedServerStore(context: Context) {
+
+    private val prefs = context.applicationContext.getSharedPreferences(
+        PREFS_NAME, Context.MODE_PRIVATE,
+    )
+    private val json = Json {
+        ignoreUnknownKeys = true
+        encodeDefaults = true
+    }
+    private val listSerializer = ListSerializer(TrustedServer.serializer())
+
+    fun list(): List<TrustedServer> {
+        val raw = prefs.getString(KEY_LIST, null) ?: return emptyList()
+        return runCatching { json.decodeFromString(listSerializer, raw) }
+            .getOrDefault(emptyList())
+    }
+
+    /** Insert-or-update by [TrustedServer.deviceId]. Most-recent first. */
+    fun upsert(server: TrustedServer) {
+        val current = list().filter { it.deviceId != server.deviceId }
+        val merged = (listOf(server) + current).take(MAX_ENTRIES)
+        save(merged)
+    }
+
+    /** Drop a single entry — used when the server returns BadTrustToken
+     *  (token rotated / revoked) so the saved entry stays in sync with
+     *  the server's view. */
+    fun forget(deviceId: String) {
+        val remaining = list().filter { it.deviceId != deviceId }
+        save(remaining)
+    }
+
+    /** Wipe every entry — for the eventual "Forget all paired PCs"
+     *  settings button. */
+    fun clearAll() {
+        prefs.edit { remove(KEY_LIST) }
+    }
+
+    private fun save(items: List<TrustedServer>) {
+        val raw = json.encodeToString(listSerializer, items)
+        prefs.edit { putString(KEY_LIST, raw) }
+    }
+
+    companion object {
+        private const val PREFS_NAME = "remotecontrol_trust"
+        private const val KEY_LIST = "trusted_servers_v1"
+
+        /** Practical upper bound — same user is unlikely to pair more
+         *  than a handful of PCs. Keeps the list bounded if the file
+         *  somehow gets churned. */
+        private const val MAX_ENTRIES = 16
+    }
+}

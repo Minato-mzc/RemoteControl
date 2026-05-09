@@ -1,6 +1,7 @@
-# ---- Rust (server-pc) ----
+# ---- Rust (workspace) ----
+target/
 server-pc/target/
-# Cargo.lock kept — this is a binary, lockfile is desirable
+# Cargo.lock kept — these are binaries, lockfile is desirable
 
 # Auto-generated demo artifacts
 server-pc/qrcode.html
