@@ -118,28 +118,43 @@ pub async fn run_server(mode: ServerMode) -> Result<()> {
             qr::print_qr_to_terminal(&primary.addr.to_string(), port, &code, &key_b64)?;
         }
     }
-    if matches!(mode, ServerMode::LanOnly | ServerMode::LanAndRelay) {
-        match qr::save_qr_html_and_open(&addrs, port, &code, &key_b64) {
+    let relay_qr_info = relay_cfg.as_ref().map(|r| qr::RelayQrInfo {
+        base_url: r.base_url.as_str(),
+        host_id: r.host_id.as_str(),
+    });
+    // Render the HTML page even in RelayOnly mode so the user has a
+    // visible QR for their phone to scan.
+    let render_html = matches!(
+        mode,
+        ServerMode::LanOnly | ServerMode::LanAndRelay | ServerMode::RelayOnly
+    );
+    if render_html {
+        let lan_addrs_for_html: &[net::DiscoveredAddr] = match mode {
+            ServerMode::RelayOnly => &[],
+            _ => &addrs,
+        };
+        match qr::save_qr_html_and_open(
+            lan_addrs_for_html,
+            port,
+            &code,
+            &key_b64,
+            relay_qr_info.as_ref(),
+        ) {
             Ok(path) => info!("QR HTML written and opened: {}", path.display()),
             Err(e) => warn!("could not write QR HTML: {e:#}"),
         }
     }
     if let Some(rcfg) = &relay_cfg {
-        // Relay-mode QR payload has its own scheme so the phone can
-        // distinguish it from a LAN QR (different connection path).
-        let relay_payload = format!(
-            "rcrelay://{base}/?host={host}&v={v}&c={code}&k={key}",
-            base = rcfg.base_url.trim_start_matches("https://").trim_start_matches("http://"),
+        let authority = rcfg
+            .base_url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://");
+        info!(
+            "relay QR payload  = rcrelay://{authority}/?host={host}&v={v}&c={code}&k=…",
             host = rcfg.host_id,
             v = config::PROTOCOL_VERSION,
             code = code,
-            key = key_b64,
         );
-        info!("relay QR payload  = {relay_payload}");
-        // We don't currently render the relay QR into the HTML page —
-        // adding it cleanly is part of the next polish pass. The user
-        // can scan whichever code they prefer (LAN from the HTML, relay
-        // from the log).
     }
 
     let cfg = Arc::new(cfg);

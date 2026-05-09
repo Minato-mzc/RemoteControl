@@ -152,25 +152,102 @@ struct PhoneOut {
 }
 
 // ============================================================================
-// Wire formats
+// Wire formats — binary tunnel framing
 // ============================================================================
+//
+// Earlier iteration used JSON+base64. That added ~33% bandwidth and made
+// every video frame an allocate+parse round-trip; over the cross-network
+// path with limited home upstream bandwidth, the inflation reliably
+// starved the tunnel and binary frames stopped arriving on the phone.
+//
+// New scheme: every host↔relay message is a Binary WebSocket frame with
+// a fixed 38-byte header followed by an opaque payload.
+//
+//   offset  size  meaning
+//   0       1     msg_type:  1=ClientOpen, 2=ClientClose, 3=Data
+//   1       36    client_id: ASCII UUIDv4 string ("xxxxxxxx-...-xxxxxxxxxxxx")
+//   37      1     text_flag: 1 if Data should be re-emitted as Message::Text
+//                            (control plane JSON), 0 for Binary (video/audio).
+//                            Reserved/zero for Open/Close.
+//   38..    n     payload:   raw bytes of the original WS message (Data only)
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "t")]
+#[derive(Debug)]
 enum TunnelFrame {
-    #[serde(rename = "client_open")]
     ClientOpen { client_id: String },
-    #[serde(rename = "client_close")]
     ClientClose { client_id: String },
-    /// Direction is implicit by the WS the frame travels on.
-    /// `text` echoes the original WS message kind so binary video frames
-    /// stay binary on the phone side.
-    #[serde(rename = "data")]
     Data {
         client_id: String,
         text: bool,
-        payload_b64: String,
+        payload: Vec<u8>,
     },
+}
+
+const TUNNEL_HEADER_LEN: usize = 38;
+const TF_OPEN: u8 = 1;
+const TF_CLOSE: u8 = 2;
+const TF_DATA: u8 = 3;
+
+impl TunnelFrame {
+    fn encode(&self) -> Vec<u8> {
+        match self {
+            TunnelFrame::ClientOpen { client_id } => {
+                let mut buf = Vec::with_capacity(TUNNEL_HEADER_LEN);
+                buf.push(TF_OPEN);
+                push_uuid(&mut buf, client_id);
+                buf.push(0); // text_flag unused
+                buf
+            }
+            TunnelFrame::ClientClose { client_id } => {
+                let mut buf = Vec::with_capacity(TUNNEL_HEADER_LEN);
+                buf.push(TF_CLOSE);
+                push_uuid(&mut buf, client_id);
+                buf.push(0);
+                buf
+            }
+            TunnelFrame::Data {
+                client_id,
+                text,
+                payload,
+            } => {
+                let mut buf = Vec::with_capacity(TUNNEL_HEADER_LEN + payload.len());
+                buf.push(TF_DATA);
+                push_uuid(&mut buf, client_id);
+                buf.push(if *text { 1 } else { 0 });
+                buf.extend_from_slice(payload);
+                buf
+            }
+        }
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < TUNNEL_HEADER_LEN {
+            return None;
+        }
+        let mty = bytes[0];
+        let client_id = std::str::from_utf8(&bytes[1..37]).ok()?.to_string();
+        let flag = bytes[37];
+        match mty {
+            TF_OPEN => Some(TunnelFrame::ClientOpen { client_id }),
+            TF_CLOSE => Some(TunnelFrame::ClientClose { client_id }),
+            TF_DATA => Some(TunnelFrame::Data {
+                client_id,
+                text: flag != 0,
+                payload: bytes[TUNNEL_HEADER_LEN..].to_vec(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+fn push_uuid(buf: &mut Vec<u8>, uuid: &str) {
+    // UUIDs from `uuid::Uuid::new_v4().to_string()` are always 36 ASCII
+    // chars in `xxxxxxxx-xxxx-Vxxx-xxxx-xxxxxxxxxxxx` form. If somehow
+    // truncated/padded, push exactly 36 to keep the header layout stable.
+    let mut bytes = [b'0'; 36];
+    let src = uuid.as_bytes();
+    let n = src.len().min(36);
+    bytes[..n].copy_from_slice(&src[..n]);
+    buf.extend_from_slice(&bytes);
 }
 
 // ============================================================================
@@ -268,60 +345,57 @@ async fn host_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
     );
     info!("host online  id={host_id}");
 
-    // Writer: relay → host
+    // Writer: relay → host. Each TunnelFrame becomes a single Binary WS
+    // frame on the wire. Binary instead of Text means video payloads (which
+    // are themselves arbitrary binary) travel byte-for-byte without UTF-8
+    // validation or base64 inflation.
     let writer = tokio::spawn(async move {
         while let Some(frame) = to_host_rx.recv().await {
-            let txt = match serde_json::to_string(&frame) {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            if sink.send(Message::Text(txt.into())).await.is_err() {
+            let bytes = frame.encode();
+            if sink.send(Message::Binary(bytes.into())).await.is_err() {
                 break;
             }
         }
         let _ = sink.close().await;
     });
 
-    // Reader: host → relay → phone
+    // Reader: host → relay → phone. Host always sends Binary tunnel frames.
     while let Some(item) = stream.next().await {
         let msg = match item {
             Ok(m) => m,
             Err(_) => break,
         };
-        match msg {
-            Message::Text(txt) => {
-                let frame: TunnelFrame = match serde_json::from_str(&txt) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        warn!("host {host_id}: bad frame from host: {e}");
-                        continue;
-                    }
-                };
-                match frame {
-                    TunnelFrame::Data {
-                        client_id,
+        let bytes = match msg {
+            Message::Binary(b) => b,
+            Message::Close(_) => break,
+            // Text from the host is unexpected with the binary protocol;
+            // ignore so we don't loop on garbage.
+            _ => continue,
+        };
+        let frame = match TunnelFrame::decode(&bytes) {
+            Some(f) => f,
+            None => {
+                warn!("host {host_id}: malformed tunnel frame ({} bytes)", bytes.len());
+                continue;
+            }
+        };
+        match frame {
+            TunnelFrame::Data {
+                client_id,
+                text,
+                payload,
+            } => {
+                let map = clients.lock().await;
+                if let Some(sender) = map.get(&client_id) {
+                    let _ = sender.send(PhoneOut {
+                        bytes: payload,
                         text,
-                        payload_b64,
-                    } => {
-                        let bytes = match base64_decode(&payload_b64) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                warn!("host {host_id}: bad base64 in data frame: {e}");
-                                continue;
-                            }
-                        };
-                        let map = clients.lock().await;
-                        if let Some(sender) = map.get(&client_id) {
-                            let _ = sender.send(PhoneOut { bytes, text });
-                        }
-                    }
-                    // Hosts don't initiate ClientOpen/Close — they just
-                    // respond to whatever phones the relay sends them.
-                    TunnelFrame::ClientOpen { .. } | TunnelFrame::ClientClose { .. } => {}
+                    });
                 }
             }
-            Message::Close(_) => break,
-            _ => {}
+            // Hosts don't initiate ClientOpen/Close — they just respond to
+            // whatever phones the relay sends them.
+            TunnelFrame::ClientOpen { .. } | TunnelFrame::ClientClose { .. } => {}
         }
     }
 
@@ -422,7 +496,10 @@ async fn client_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
         );
     });
 
-    // Reader: phone → relay → host
+    // Reader: phone → relay → host. Phone's WS messages (Text for
+    // control plane JSON, Binary if the protocol ever needs upstream
+    // binary) travel as TunnelFrame::Data — host re-emits them on its
+    // virtual peer queue with the same kind.
     while let Some(item) = stream.next().await {
         let msg = match item {
             Ok(m) => m,
@@ -438,7 +515,7 @@ async fn client_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
             .send(TunnelFrame::Data {
                 client_id: client_id.clone(),
                 text,
-                payload_b64: base64_url_no_pad(&bytes),
+                payload: bytes,
             })
             .is_err()
         {

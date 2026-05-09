@@ -80,6 +80,14 @@ data class QrPayload(
             val key = uri.getQueryParameter("k")?.takeIf { it.isNotBlank() } ?: return null
             val hostId = uri.getQueryParameter("host")?.takeIf { it.isNotBlank() }
                 ?: return null
+            // `tls` is set by the server based on its configured `base_url`:
+            // `https://...` → tls=1 (production caddy/Let's Encrypt deploy),
+            // `http://...`  → tls=0 (LAN-only smoke test of the relay
+            // protocol stack against a plain-HTTP relay binary).
+            // Default to true (TLS) when the param is absent so old QRs
+            // generated before this field existed still favor secure
+            // transport rather than silently downgrading.
+            val tls = uri.getQueryParameter("tls")?.let { it != "0" } ?: true
             return QrPayload(
                 host = host,
                 port = port,
@@ -87,8 +95,7 @@ data class QrPayload(
                 keyB64Url = key,
                 version = version,
                 relayHostId = hostId,
-                // Relays sit behind TLS by deployment convention.
-                secure = true,
+                secure = tls,
             )
         }
     }

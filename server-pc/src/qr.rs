@@ -35,17 +35,31 @@ pub fn print_qr_to_terminal(host: &str, port: u16, code: &str, key_b64url: &str)
     Ok(())
 }
 
-/// Render one HTML page with a QR tile per discovered LAN address. The user
-/// scans whichever tile matches the network the phone is currently on (home
-/// Wi-Fi vs. phone hotspot vs. wired). Auto-opens in the default browser.
+/// One relay endpoint to render alongside the LAN cards on the QR page.
+/// Constructed by `lib.rs` from the active `RelayConfig`; threaded
+/// through here so this module doesn't have to know about `relay_client`.
+pub struct RelayQrInfo<'a> {
+    /// Display URL — e.g. `https://relay.example.com:443`. Used both
+    /// for the rendered card label and for building the `rcrelay://`
+    /// payload host portion.
+    pub base_url: &'a str,
+    /// `host_id` minted by the relay during one-shot provisioning.
+    pub host_id: &'a str,
+}
+
+/// Render one HTML page with a QR tile per discovered LAN address (and
+/// optionally one for the configured relay). The user scans whichever
+/// tile matches where the phone is — home Wi-Fi, phone hotspot, or
+/// cross-network via relay. Auto-opens in the default browser.
 pub fn save_qr_html_and_open(
     addrs: &[DiscoveredAddr],
     port: u16,
     code: &str,
     key_b64url: &str,
+    relay: Option<&RelayQrInfo<'_>>,
 ) -> Result<PathBuf> {
-    if addrs.is_empty() {
-        anyhow::bail!("no LAN address candidates");
+    if addrs.is_empty() && relay.is_none() {
+        anyhow::bail!("no LAN address candidates and no relay configured");
     }
 
     // Drop virtual / Hyper-V switch interfaces from the HTML — phones can't
@@ -99,6 +113,56 @@ pub fn save_qr_html_and_open(
         );
     }
 
+    // Optional cross-network card. Different label/border-color so the
+    // user can tell at a glance which is for "same Wi-Fi" and which is
+    // "different network" — the latter is meant for when scanning the
+    // LAN cards is impossible (4G, hotel Wi-Fi, etc.).
+    if let Some(r) = relay {
+        // Strip the scheme for display + payload: `rcrelay://<host>/?...`
+        // expects a host:port-style authority, not a full https:// URL.
+        // Whether the phone should dial via wss:// (TLS) or plain ws:// is
+        // captured in the `tls` query param — derived from the configured
+        // base_url. Default deploys put caddy/Let's Encrypt in front and
+        // use `https://` (so tls=1); local-LAN test rigs running the
+        // relay binary plain on `:7891` use `http://` (tls=0). The phone
+        // can't sniff this from the URL alone.
+        let authority = r
+            .base_url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_end_matches('/');
+        let tls = if r.base_url.starts_with("https://") { 1 } else { 0 };
+        let payload = format!(
+            "rcrelay://{authority}/?host={host}&v={v}&c={code}&k={key}&tls={tls}",
+            authority = authority,
+            host = r.host_id,
+            v = PROTOCOL_VERSION,
+            code = code,
+            key = key_b64url,
+            tls = tls,
+        );
+        let qr = QrCode::new(payload.as_bytes()).context("build relay QR")?;
+        let svg_xml = qr
+            .render::<svg::Color>()
+            .min_dimensions(280, 280)
+            .quiet_zone(true)
+            .dark_color(svg::Color("#1f4d8b"))
+            .light_color(svg::Color("#ffffff"))
+            .build();
+        let _ = write!(
+            &mut tiles,
+            r##"<div class="card relay">
+                  <div class="qr">{svg_xml}</div>
+                  <div class="ip">{authority}</div>
+                  <div class="iface relay-tag">跨网络中继 · 不同 Wi-Fi / 4G/5G 时使用</div>
+                  <div class="meta">{payload}</div>
+                </div>"##,
+            svg_xml = svg_xml,
+            authority = html_escape(authority),
+            payload = html_escape(&payload),
+        );
+    }
+
     let html = format!(
         r##"<!doctype html>
 <html lang="zh-CN">
@@ -124,6 +188,10 @@ pub fn save_qr_html_and_open(
     .iface.ok {{ color: #2c7a3e; }}
     .iface.warn {{ color: #b87900; }}
     .iface.bad {{ color: #b00020; }}
+    /* Relay card: subtly different border so it's distinguishable from
+       LAN cards but still feels part of the set. */
+    .card.relay {{ border-color: #1f4d8b; box-shadow: 0 0 0 1px #1f4d8b inset; }}
+    .iface.relay-tag {{ color: #1f4d8b; font-weight: 600; }}
     .meta {{ font-family: ui-monospace, Consolas, monospace; color: #999;
              font-size: 11px; margin-top: 12px; word-break: break-all; }}
   </style>

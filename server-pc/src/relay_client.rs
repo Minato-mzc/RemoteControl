@@ -126,7 +126,15 @@ pub async fn provision(base_url: &str, server_name: &str) -> Result<RelayConfig>
         host_id: String,
         host_token: String,
     }
-    let client = Client::new();
+    // Bypass system HTTP_PROXY / HTTPS_PROXY env vars. Many users have
+    // these set globally to point at a Clash/V2Ray-style local proxy,
+    // which then returns 502 for LAN-bound URLs (the proxy refuses to
+    // tunnel into the local network). The relay URL is whatever the
+    // user explicitly typed, so we want a direct connection regardless.
+    let client = Client::builder()
+        .no_proxy()
+        .build()
+        .context("build reqwest client")?;
     let url = format!("{}/v1/host/register", base_url.trim_end_matches('/'));
     let resp = client
         .post(&url)
@@ -149,20 +157,95 @@ pub async fn provision(base_url: &str, server_name: &str) -> Result<RelayConfig>
 // ============================================================================
 // Tunnel framing — wire-compatible with relay/src/main.rs::TunnelFrame.
 // ============================================================================
+//
+// Binary header layout:
+//   [0]      msg_type: 1=Open, 2=Close, 3=Data
+//   [1..37]  client_id (36-byte ASCII UUIDv4)
+//   [37]     text_flag (1 if payload is Text, 0 if Binary; reserved=0 for Open/Close)
+//   [38..]   payload (Data only)
+//
+// Same scheme on both sides; switching off JSON+base64 was driven by the
+// 33% bandwidth inflation choking the cross-network path on residential
+// upstream links.
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "t")]
+#[derive(Debug)]
 pub enum TunnelFrame {
-    #[serde(rename = "client_open")]
-    ClientOpen { client_id: String },
-    #[serde(rename = "client_close")]
-    ClientClose { client_id: String },
-    #[serde(rename = "data")]
+    ClientOpen {
+        client_id: String,
+    },
+    ClientClose {
+        client_id: String,
+    },
     Data {
         client_id: String,
         text: bool,
-        payload_b64: String,
+        payload: Vec<u8>,
     },
+}
+
+const TUNNEL_HEADER_LEN: usize = 38;
+const TF_OPEN: u8 = 1;
+const TF_CLOSE: u8 = 2;
+const TF_DATA: u8 = 3;
+
+impl TunnelFrame {
+    fn encode(&self) -> Vec<u8> {
+        match self {
+            TunnelFrame::ClientOpen { client_id } => {
+                let mut buf = Vec::with_capacity(TUNNEL_HEADER_LEN);
+                buf.push(TF_OPEN);
+                push_uuid(&mut buf, client_id);
+                buf.push(0);
+                buf
+            }
+            TunnelFrame::ClientClose { client_id } => {
+                let mut buf = Vec::with_capacity(TUNNEL_HEADER_LEN);
+                buf.push(TF_CLOSE);
+                push_uuid(&mut buf, client_id);
+                buf.push(0);
+                buf
+            }
+            TunnelFrame::Data {
+                client_id,
+                text,
+                payload,
+            } => {
+                let mut buf = Vec::with_capacity(TUNNEL_HEADER_LEN + payload.len());
+                buf.push(TF_DATA);
+                push_uuid(&mut buf, client_id);
+                buf.push(if *text { 1 } else { 0 });
+                buf.extend_from_slice(payload);
+                buf
+            }
+        }
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < TUNNEL_HEADER_LEN {
+            return None;
+        }
+        let mty = bytes[0];
+        let client_id = std::str::from_utf8(&bytes[1..37]).ok()?.to_string();
+        let flag = bytes[37];
+        match mty {
+            TF_OPEN => Some(TunnelFrame::ClientOpen { client_id }),
+            TF_CLOSE => Some(TunnelFrame::ClientClose { client_id }),
+            TF_DATA => Some(TunnelFrame::Data {
+                client_id,
+                text: flag != 0,
+                payload: bytes[TUNNEL_HEADER_LEN..].to_vec(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+fn push_uuid(buf: &mut Vec<u8>, uuid: &str) {
+    let mut bytes = [b'0'; 36];
+    let src = uuid.as_bytes();
+    let n = src.len().min(36);
+    bytes[..n].copy_from_slice(&src[..n]);
+    buf.extend_from_slice(&bytes);
 }
 
 // ============================================================================
@@ -233,15 +316,18 @@ impl RelayClient {
 
         let reader = tokio::spawn(async move {
             while let Some(item) = ws_stream.next().await {
-                let msg = match item {
-                    Ok(Message::Text(t)) => t,
+                let bytes = match item {
+                    Ok(Message::Binary(b)) => b,
                     Ok(Message::Close(_)) | Err(_) => break,
+                    // Text on the host side is unexpected after the
+                    // binary-tunnel switch; ignore it (could be a leftover
+                    // from a mismatched relay version).
                     _ => continue,
                 };
-                let frame: TunnelFrame = match serde_json::from_str(&msg) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        warn!("relay bad tunnel frame: {e}");
+                let frame = match TunnelFrame::decode(&bytes) {
+                    Some(f) => f,
+                    None => {
+                        warn!("relay malformed tunnel frame ({} bytes)", bytes.len());
                         continue;
                     }
                 };
@@ -293,7 +379,7 @@ impl RelayClient {
                                 let frame = TunnelFrame::Data {
                                     client_id: writer_cid.clone(),
                                     text,
-                                    payload_b64: URL_SAFE_NO_PAD.encode(&bytes),
+                                    payload: bytes,
                                 };
                                 if writer_out_tx.send(frame).is_err() {
                                     break;
@@ -313,22 +399,15 @@ impl RelayClient {
                     TunnelFrame::Data {
                         client_id,
                         text,
-                        payload_b64,
+                        payload,
                     } => {
-                        let bytes = match URL_SAFE_NO_PAD.decode(payload_b64.as_bytes()) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                warn!("relay bad base64 payload: {e}");
-                                continue;
-                            }
-                        };
                         let msg = if text {
-                            match String::from_utf8(bytes) {
+                            match String::from_utf8(payload) {
                                 Ok(s) => Message::Text(s.into()),
                                 Err(_) => continue,
                             }
                         } else {
-                            Message::Binary(bytes.into())
+                            Message::Binary(payload.into())
                         };
                         if let Some(sess) = reader_sessions.lock().await.get(&client_id) {
                             let _ = sess.inbox_tx.send(msg);
@@ -338,16 +417,12 @@ impl RelayClient {
             }
         });
 
-        // Writer: us → relay. One task that owns the sink, drains the
-        // merged tunnel-frame queue (every per-phone-session pump funnels
-        // here), and serializes onto the host WS as Text messages.
+        // Writer: us → relay. Binary tunnel frames go straight onto the
+        // wire — one Message::Binary per TunnelFrame, no JSON envelope.
         let writer = tokio::spawn(async move {
             while let Some(frame) = host_out_rx.recv().await {
-                let txt = match serde_json::to_string(&frame) {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-                if ws_sink.send(Message::Text(txt.into())).await.is_err() {
+                let bytes = frame.encode();
+                if ws_sink.send(Message::Binary(bytes.into())).await.is_err() {
                     break;
                 }
             }
