@@ -1344,6 +1344,7 @@ dependencies = [
  "anyhow",
  "base64",
  "bindgen",
+ "clap",
  "fast_image_resize",
  "futures-util",
  "hmac",

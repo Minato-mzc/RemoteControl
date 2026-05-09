@@ -24,10 +24,22 @@
 //! no double base64ing of video frames.
 
 use anyhow::{Context, Result};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use tokio::sync::mpsc;
-use tracing::warn;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
+use tracing::{info, warn};
+
+use crate::config::Config;
+use crate::connection::{run_connection, OutboundTx};
+use crate::pairing::PairingStore;
+use crate::trusted_devices::TrustedDevicesStore;
 
 /// On-disk record produced by [`provision`] and consumed on every
 /// subsequent boot. Stored next to `trusted_devices.json` so the user
@@ -154,33 +166,19 @@ pub enum TunnelFrame {
 }
 
 // ============================================================================
-// Virtual peer — message channels exposed to the existing ws_server logic so
-// the relay tunnel and a real WebSocket are interchangeable transports.
+// RelayClient — long-lived host WS + per-phone session multiplexer.
 // ============================================================================
 
-/// One half of a [`VirtualPeer`] pair: messages from the phone arrive on
-/// `incoming`; messages going to the phone get pushed onto `outgoing`.
-/// The relay client task drives `outgoing` onto its host WebSocket as
-/// `TunnelFrame::Data`s, and feeds `incoming` from the matching tunnel
-/// frames. The existing `handle_connection_inner` (to be extracted from
-/// `ws_server::handle_connection`) reads from `incoming` and writes to
-/// `outgoing` — totally agnostic to whether the peer is a real WS or
-/// the relay.
-pub struct VirtualPeer {
-    /// Messages flowing phone → PC.
-    pub incoming: mpsc::Receiver<TunnelMessage>,
-    /// Messages flowing PC → phone.
-    pub outgoing: mpsc::Sender<TunnelMessage>,
+/// Per-phone-session driver. Owns the side that pushes frames into
+/// [`crate::connection::run_connection`] and pulls outbound frames from
+/// it. The relay's host-WS loop matches incoming `TunnelFrame::Data`
+/// to a phone session by its `client_id` and forwards to the right one.
+struct PhoneSession {
+    /// Sink the host loop writes phone-originated WS messages into;
+    /// drains into `connection::run_connection`'s inbox.
+    inbox_tx: mpsc::UnboundedSender<Message>,
 }
 
-/// Wire-equivalent of a single WebSocket message inside the tunnel.
-#[derive(Debug, Clone)]
-pub enum TunnelMessage {
-    Text(String),
-    Binary(Vec<u8>),
-}
-
-#[allow(dead_code)] // used as TODO scaffolding, actual run() lands in next change
 pub struct RelayClient {
     cfg: RelayConfig,
 }
@@ -190,17 +188,199 @@ impl RelayClient {
         Self { cfg }
     }
 
-    /// Run the long-lived host WebSocket loop. Returns when the WS
-    /// drops; caller should reconnect with backoff.
-    ///
-    /// **Stub** — the wiring into ws_server is the next milestone. For
-    /// now we just log if asked to run.
-    pub async fn run(self) -> Result<()> {
-        warn!(
-            "RelayClient.run() called but the integration with ws_server is not finished yet — \
-             relay mode is currently no-op (host_id={})",
+    /// Run one long-lived host WebSocket loop. Returns when the WS
+    /// drops or the relay rejects us; the caller should retry with
+    /// backoff. Spawns one background task per phone connecting through
+    /// the tunnel.
+    pub async fn run(
+        self,
+        pairing: Arc<PairingStore>,
+        trusted: Arc<TrustedDevicesStore>,
+        cfg: Arc<Config>,
+    ) -> Result<()> {
+        // Translate http(s) base URL into ws(s) for the long-lived WS.
+        // We accept either form so the user's relay.toml can store
+        // whichever they typed.
+        let ws_url = host_ws_url(&self.cfg)?;
+        info!("dialing relay  url={ws_url}  host_id={}", self.cfg.host_id);
+
+        let (ws, _resp) = connect_async(&ws_url)
+            .await
+            .with_context(|| format!("relay dial {ws_url}"))?;
+        info!(
+            "relay connected  host_id={}  waiting for phone sessions",
             self.cfg.host_id
         );
+        let (mut ws_sink, mut ws_stream) = ws.split();
+
+        // Per-host phone-session map. The host-WS reader pushes inbound
+        // tunnel data to the matching session; the writer drains a
+        // single outbound queue (one per host WS) merging output from
+        // every active phone session.
+        let sessions: Arc<Mutex<HashMap<String, PhoneSession>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (host_out_tx, mut host_out_rx) =
+            mpsc::unbounded_channel::<TunnelFrame>();
+
+        // Reader: relay → us. Demuxes `client_open / close / data` into
+        // per-phone session pumps; spawns a `run_connection` task per
+        // ClientOpen.
+        let reader_pairing = pairing.clone();
+        let reader_trusted = trusted.clone();
+        let reader_cfg = cfg.clone();
+        let reader_sessions = sessions.clone();
+        let reader_out_tx = host_out_tx.clone();
+
+        let reader = tokio::spawn(async move {
+            while let Some(item) = ws_stream.next().await {
+                let msg = match item {
+                    Ok(Message::Text(t)) => t,
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    _ => continue,
+                };
+                let frame: TunnelFrame = match serde_json::from_str(&msg) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        warn!("relay bad tunnel frame: {e}");
+                        continue;
+                    }
+                };
+                match frame {
+                    TunnelFrame::ClientOpen { client_id } => {
+                        let (inbox_tx, inbox_rx) =
+                            mpsc::unbounded_channel::<Message>();
+                        let (outbox_tx, mut outbox_rx) =
+                            mpsc::unbounded_channel::<Message>();
+                        reader_sessions.lock().await.insert(
+                            client_id.clone(),
+                            PhoneSession { inbox_tx },
+                        );
+
+                        // Logic: the same state-machine the LAN path uses.
+                        let label = format!("relay/{client_id}");
+                        let logic_pairing = reader_pairing.clone();
+                        let logic_trusted = reader_trusted.clone();
+                        let logic_cfg = reader_cfg.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = run_connection(
+                                label,
+                                inbox_rx,
+                                outbox_tx,
+                                logic_pairing,
+                                logic_trusted,
+                                logic_cfg,
+                            )
+                            .await
+                            {
+                                warn!("tunnel session ended: {e:#}");
+                            }
+                        });
+
+                        // Outbound pump: this session's `OutboundTx` drains
+                        // here and we wrap into a TunnelFrame::Data targeted
+                        // at the same client_id, sending to the host writer.
+                        let writer_out_tx = reader_out_tx.clone();
+                        let writer_sessions = reader_sessions.clone();
+                        let writer_cid = client_id.clone();
+                        tokio::spawn(async move {
+                            while let Some(m) = outbox_rx.recv().await {
+                                let (text, bytes) = match m {
+                                    Message::Text(s) => (true, s.as_bytes().to_vec()),
+                                    Message::Binary(b) => (false, b.to_vec()),
+                                    Message::Close(_) => break,
+                                    _ => continue,
+                                };
+                                let frame = TunnelFrame::Data {
+                                    client_id: writer_cid.clone(),
+                                    text,
+                                    payload_b64: URL_SAFE_NO_PAD.encode(&bytes),
+                                };
+                                if writer_out_tx.send(frame).is_err() {
+                                    break;
+                                }
+                            }
+                            // Logic side dropped its OutboundTx → session over.
+                            writer_sessions.lock().await.remove(&writer_cid);
+                        });
+                    }
+
+                    TunnelFrame::ClientClose { client_id } => {
+                        // Remove the session — its inbox_tx drops, run_connection
+                        // sees None on next recv, exits cleanly.
+                        reader_sessions.lock().await.remove(&client_id);
+                    }
+
+                    TunnelFrame::Data {
+                        client_id,
+                        text,
+                        payload_b64,
+                    } => {
+                        let bytes = match URL_SAFE_NO_PAD.decode(payload_b64.as_bytes()) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                warn!("relay bad base64 payload: {e}");
+                                continue;
+                            }
+                        };
+                        let msg = if text {
+                            match String::from_utf8(bytes) {
+                                Ok(s) => Message::Text(s.into()),
+                                Err(_) => continue,
+                            }
+                        } else {
+                            Message::Binary(bytes.into())
+                        };
+                        if let Some(sess) = reader_sessions.lock().await.get(&client_id) {
+                            let _ = sess.inbox_tx.send(msg);
+                        }
+                    }
+                }
+            }
+        });
+
+        // Writer: us → relay. One task that owns the sink, drains the
+        // merged tunnel-frame queue (every per-phone-session pump funnels
+        // here), and serializes onto the host WS as Text messages.
+        let writer = tokio::spawn(async move {
+            while let Some(frame) = host_out_rx.recv().await {
+                let txt = match serde_json::to_string(&frame) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                if ws_sink.send(Message::Text(txt.into())).await.is_err() {
+                    break;
+                }
+            }
+            let _ = ws_sink.close().await;
+        });
+
+        // Whichever side dies first, drop the other.
+        tokio::select! {
+            _ = reader => {}
+            _ = writer => {}
+        };
+        info!("relay disconnected  host_id={}", self.cfg.host_id);
         Ok(())
     }
+}
+
+/// Convert a `http(s)://relay.example.com` base URL into the WS form
+/// for the long-lived host endpoint, with auth params already included.
+fn host_ws_url(cfg: &RelayConfig) -> Result<String> {
+    let base = cfg.base_url.trim_end_matches('/');
+    let scheme = if base.starts_with("https://") {
+        "wss"
+    } else if base.starts_with("http://") {
+        "ws"
+    } else {
+        anyhow::bail!("relay base_url must start with http:// or https://, got {base}");
+    };
+    let host_part = base
+        .splitn(2, "://")
+        .nth(1)
+        .ok_or_else(|| anyhow::anyhow!("malformed relay base_url"))?;
+    Ok(format!(
+        "{scheme}://{host_part}/v1/host?host_id={}&host_token={}",
+        cfg.host_id, cfg.host_token
+    ))
 }

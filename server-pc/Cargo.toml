@@ -64,6 +64,7 @@ libloading = "0.8"
 # resulting host_id/host_token persistence.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 toml = "0.8"
+clap = { version = "4", features = ["derive"] }
 
 # Windows-only: DXGI Desktop Duplication for capture, Media Foundation for H.264 encode.
 [target.'cfg(windows)'.dependencies]
