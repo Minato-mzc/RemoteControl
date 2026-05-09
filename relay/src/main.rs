@@ -473,21 +473,40 @@ async fn client_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
     }
     info!("client connected  id={client_id}  host={host_id}");
 
-    // Writer: host → phone
+    // Pong channel — phone Pings come in via the reader, get reflected
+    // through this onto the writer task. axum/tokio-tungstenite does NOT
+    // auto-respond to Ping, and OkHttp on the phone gives up after
+    // `pingInterval` (20s by default) without a Pong. So we DIY the
+    // keepalive bounce-back here.
+    let (pong_tx, mut pong_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+    // Writer: host → phone (and phone-Pong-replies). One task that owns
+    // `sink`, draining either queue.
     let writer_client_id = client_id.clone();
     let writer_host_id = host_id.clone();
     let writer = tokio::spawn(async move {
-        while let Some(out) = out_rx.recv().await {
-            let msg = if out.text {
-                match String::from_utf8(out.bytes) {
-                    Ok(s) => Message::Text(s.into()),
-                    Err(_) => continue, // host marked text but bytes weren't UTF-8 — drop
+        loop {
+            tokio::select! {
+                maybe_out = out_rx.recv() => {
+                    let Some(out) = maybe_out else { break };
+                    let msg = if out.text {
+                        match String::from_utf8(out.bytes) {
+                            Ok(s) => Message::Text(s.into()),
+                            Err(_) => continue,
+                        }
+                    } else {
+                        Message::Binary(out.bytes.into())
+                    };
+                    if sink.send(msg).await.is_err() {
+                        break;
+                    }
                 }
-            } else {
-                Message::Binary(out.bytes.into())
-            };
-            if sink.send(msg).await.is_err() {
-                break;
+                maybe_pong = pong_rx.recv() => {
+                    let Some(payload) = maybe_pong else { continue };
+                    if sink.send(Message::Pong(payload.into())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
         let _ = sink.close().await;
@@ -496,10 +515,7 @@ async fn client_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
         );
     });
 
-    // Reader: phone → relay → host. Phone's WS messages (Text for
-    // control plane JSON, Binary if the protocol ever needs upstream
-    // binary) travel as TunnelFrame::Data — host re-emits them on its
-    // virtual peer queue with the same kind.
+    // Reader: phone → relay → host.
     while let Some(item) = stream.next().await {
         let msg = match item {
             Ok(m) => m,
@@ -509,6 +525,11 @@ async fn client_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
             Message::Text(t) => (true, t.as_bytes().to_vec()),
             Message::Binary(b) => (false, b.to_vec()),
             Message::Close(_) => break,
+            Message::Ping(p) => {
+                let _ = pong_tx.send(p.to_vec());
+                continue;
+            }
+            Message::Pong(_) => continue,
             _ => continue,
         };
         if to_host
@@ -522,6 +543,8 @@ async fn client_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
             break;
         }
     }
+    // Reader exited → drop pong_tx so writer's pong_rx returns None.
+    drop(pong_tx);
 
     // Cleanup: notify host, drop senders, await writer.
     let _ = to_host.send(TunnelFrame::ClientClose {
