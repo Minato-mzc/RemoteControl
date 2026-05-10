@@ -126,12 +126,26 @@ pub fn save_qr_html_and_open(
         // use `https://` (so tls=1); local-LAN test rigs running the
         // relay binary plain on `:7891` use `http://` (tls=0). The phone
         // can't sniff this from the URL alone.
-        let authority = r
+        let scheme_is_https = r.base_url.starts_with("https://");
+        let stripped = r
             .base_url
             .trim_start_matches("https://")
             .trim_start_matches("http://")
             .trim_end_matches('/');
-        let tls = if r.base_url.starts_with("https://") { 1 } else { 0 };
+        // ALWAYS emit an explicit port in the authority. If `base_url` was
+        // typed without a port (e.g. `http://1.2.3.4`), Android's URI
+        // parser surfaces port=-1 and the QrPayload Kotlin parser then
+        // falls back to its own default (443). That default is wrong for
+        // a plain-HTTP relay on :80 — the phone would dial 443, hang,
+        // time out, fail. Inject the scheme's default port here so the
+        // QR carries unambiguous host:port either way.
+        let authority = if stripped.contains(':') {
+            stripped.to_string()
+        } else {
+            let default_port = if scheme_is_https { 443 } else { 80 };
+            format!("{stripped}:{default_port}")
+        };
+        let tls = if scheme_is_https { 1 } else { 0 };
         let payload = format!(
             "rcrelay://{authority}/?host={host}&v={v}&c={code}&k={key}&tls={tls}",
             authority = authority,
@@ -158,7 +172,7 @@ pub fn save_qr_html_and_open(
                   <div class="meta">{payload}</div>
                 </div>"##,
             svg_xml = svg_xml,
-            authority = html_escape(authority),
+            authority = html_escape(&authority),
             payload = html_escape(&payload),
         );
     }

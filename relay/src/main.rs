@@ -61,8 +61,9 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -119,6 +120,13 @@ struct RelayState {
     /// Live host bookkeeping. Set when the host's WS upgrades, removed
     /// when it drops. Phones look up their target here.
     online: Mutex<HashMap<String, OnlineHost>>,
+    /// Monotonic counter handed out per host_loop on entry. Lets the
+    /// loop notice "the entry in `online` is no longer mine" so it
+    /// doesn't clobber a successor when its own stale TCP finally dies.
+    /// Without this, a PC that's already been displaced would, on its
+    /// reader exit, `online.remove(host_id)` and silently take down the
+    /// new live session.
+    next_instance: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -132,6 +140,10 @@ struct HostRecord {
 }
 
 struct OnlineHost {
+    /// Per-loop instance tag. Compared against the local `my_instance`
+    /// at cleanup time — if they don't match, the entry already belongs
+    /// to a successor (we were displaced) and we leave it alone.
+    instance: u64,
     /// Anything queued here ends up on the host's WebSocket as a
     /// `TunnelFrame`. The host writer task drains it.
     to_host: mpsc::UnboundedSender<TunnelFrame>,
@@ -141,7 +153,24 @@ struct OnlineHost {
     /// WS. Wrapped in a Mutex because the host loop and individual
     /// client loops both need to mutate the map (open/close on either
     /// side).
-    clients: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<PhoneOut>>>>,
+    ///
+    /// Bounded — capacity [`PER_CLIENT_QUEUE_CAP`]. When the phone's WS
+    /// is congested (slow 4G, momentary radio dip, etc.) the writer's
+    /// `sink.send` stalls and queue depth grows; if we let it grow
+    /// unbounded, by the time the link recovers we'd be replaying many
+    /// seconds of stale video. Instead, the host_loop reader drops
+    /// surplus *Binary* frames at insertion time (P-frames will glitch
+    /// until next IDR every ~5s — fine for desktop control). Text
+    /// frames carry control-plane messages (helloOk, authOk, frame
+    /// stats) and are pushed with a blocking `send().await` so they
+    /// never get dropped.
+    clients: Arc<Mutex<HashMap<String, mpsc::Sender<PhoneOut>>>>,
+    /// Notified by a *new* host_loop when it displaces this entry.
+    /// The old reader selects on this in addition to its WS stream so
+    /// we don't have to wait for TCP keepalive (default 2hr on Linux)
+    /// to surface a dead peer — the new connection is the authoritative
+    /// signal that the old one is stale.
+    cancel: Arc<Notify>,
 }
 
 /// One message destined for a phone's WS.
@@ -150,6 +179,13 @@ struct PhoneOut {
     /// True → re-emit as `Message::Text`; false → `Message::Binary`.
     text: bool,
 }
+
+/// Per-phone outbound queue capacity. At ~30 fps and a 5 s GOP this is
+/// roughly 2 s of buffered video — enough to ride out a brief radio dip,
+/// small enough that the phone never receives content that's already
+/// stale. Past this many frames, the host_loop reader drops new Binary
+/// frames at insertion time rather than queueing forever.
+const PER_CLIENT_QUEUE_CAP: usize = 64;
 
 // ============================================================================
 // Wire formats — binary tunnel framing
@@ -320,11 +356,13 @@ async fn host_ws(
     if !allowed {
         return (StatusCode::UNAUTHORIZED, "bad host_id/host_token").into_response();
     }
-    if state.online.lock().await.contains_key(&p.host_id) {
-        // Only one PC instance per host_id — racy double-registration is
-        // either a misconfiguration or a hostile takeover. Fail closed.
-        return (StatusCode::CONFLICT, "host already online").into_response();
-    }
+    // No 409 anymore. If something is already live on this host_id, we
+    // are by definition the same owner (we just passed token check), so
+    // we get to take the slot. The takeover happens inside `host_loop`
+    // under the `online` lock so the displacement is atomic with the
+    // insert of our own entry — phones that race in during the swap
+    // either find the old entry (and route to the doomed loop, which
+    // is harmless: it'll close shortly) or the new one.
     ws.on_upgrade(move |socket| host_loop(state, p.host_id, socket))
 }
 
@@ -333,17 +371,40 @@ async fn host_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
     let (to_host_tx, mut to_host_rx) = mpsc::unbounded_channel::<TunnelFrame>();
     let clients = Arc::new(Mutex::new(HashMap::<
         String,
-        mpsc::UnboundedSender<PhoneOut>,
+        mpsc::Sender<PhoneOut>,
     >::new()));
 
-    state.online.lock().await.insert(
-        host_id.clone(),
-        OnlineHost {
-            to_host: to_host_tx.clone(),
-            clients: clients.clone(),
-        },
-    );
-    info!("host online  id={host_id}");
+    let my_instance = state.next_instance.fetch_add(1, Ordering::Relaxed);
+    let cancel = Arc::new(Notify::new());
+
+    // Atomic swap-in. If someone was already there (a stale loop whose
+    // TCP hasn't surfaced as dead yet), we displace it: dropping `old`
+    // here drops its `to_host` sender clone, but the old loop also holds
+    // its own clone, so we additionally `notify_one()` the old loop's
+    // cancel signal to wake its select! and break the reader.
+    let displaced = {
+        let mut online = state.online.lock().await;
+        online.insert(
+            host_id.clone(),
+            OnlineHost {
+                instance: my_instance,
+                to_host: to_host_tx.clone(),
+                clients: clients.clone(),
+                cancel: cancel.clone(),
+            },
+        )
+    };
+    if let Some(old) = displaced {
+        warn!(
+            "host {host_id}: displacing stale session  old_instance={}",
+            old.instance
+        );
+        old.cancel.notify_one();
+        // Drain phones attached to the old session so they reconnect
+        // through the new tunnel rather than sitting on a dead route.
+        old.clients.lock().await.clear();
+    }
+    info!("host online  id={host_id}  instance={my_instance}");
 
     // Writer: relay → host. Each TunnelFrame becomes a single Binary WS
     // frame on the wire. Binary instead of Text means video payloads (which
@@ -360,47 +421,101 @@ async fn host_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
     });
 
     // Reader: host → relay → phone. Host always sends Binary tunnel frames.
-    while let Some(item) = stream.next().await {
-        let msg = match item {
-            Ok(m) => m,
-            Err(_) => break,
-        };
-        let bytes = match msg {
-            Message::Binary(b) => b,
-            Message::Close(_) => break,
-            // Text from the host is unexpected with the binary protocol;
-            // ignore so we don't loop on garbage.
-            _ => continue,
-        };
-        let frame = match TunnelFrame::decode(&bytes) {
-            Some(f) => f,
-            None => {
-                warn!("host {host_id}: malformed tunnel frame ({} bytes)", bytes.len());
-                continue;
+    // Selects on the cancel signal too so a successor can boot us out
+    // immediately instead of waiting on TCP keepalive.
+    loop {
+        tokio::select! {
+            _ = cancel.notified() => {
+                warn!("host {host_id}  instance={my_instance}: cancelled by successor");
+                break;
             }
-        };
-        match frame {
-            TunnelFrame::Data {
-                client_id,
-                text,
-                payload,
-            } => {
-                let map = clients.lock().await;
-                if let Some(sender) = map.get(&client_id) {
-                    let _ = sender.send(PhoneOut {
-                        bytes: payload,
+            maybe = stream.next() => {
+                let Some(item) = maybe else { break };
+                let msg = match item {
+                    Ok(m) => m,
+                    Err(_) => break,
+                };
+                let bytes = match msg {
+                    Message::Binary(b) => b,
+                    Message::Close(_) => break,
+                    // Text from the host is unexpected with the binary
+                    // protocol; ignore so we don't loop on garbage.
+                    _ => continue,
+                };
+                let frame = match TunnelFrame::decode(&bytes) {
+                    Some(f) => f,
+                    None => {
+                        warn!(
+                            "host {host_id}: malformed tunnel frame ({} bytes)",
+                            bytes.len()
+                        );
+                        continue;
+                    }
+                };
+                match frame {
+                    TunnelFrame::Data {
+                        client_id,
                         text,
-                    });
+                        payload,
+                    } => {
+                        // Snapshot the sender out of the map so we don't
+                        // hold the mutex across the .await below — that'd
+                        // serialize all client routing through one lock.
+                        let sender = {
+                            let map = clients.lock().await;
+                            map.get(&client_id).cloned()
+                        };
+                        if let Some(sender) = sender {
+                            let out = PhoneOut { bytes: payload, text };
+                            if text {
+                                // Control-plane (helloOk, authOk, codec
+                                // params, etc.). Must not be dropped — wait
+                                // for queue room. In practice this only
+                                // blocks if the link is hosed enough that
+                                // we're going to disconnect anyway.
+                                let _ = sender.send(out).await;
+                            } else {
+                                // Video / audio frame. Drop on full queue —
+                                // a stale frame helps no one. Phone's
+                                // decoder will glitch until next IDR (≤5s)
+                                // and recover, which is far better than
+                                // playing back many seconds of video that
+                                // arrived after the user already moved on.
+                                if sender.try_send(out).is_err() {
+                                    // Could be QueueFull or QueueClosed.
+                                    // Closed = client_loop already exited;
+                                    // map cleanup will catch it shortly.
+                                    // Full = backpressure; drop is the
+                                    // intended behavior. Either way, no
+                                    // log per drop (would flood under load)
+                                    // — host_loop has no good way to
+                                    // distinguish here without leaking
+                                    // tokio::sync::mpsc error variants.
+                                }
+                            }
+                        }
+                    }
+                    // Hosts don't initiate ClientOpen/Close — they just
+                    // respond to whatever phones the relay sends them.
+                    TunnelFrame::ClientOpen { .. } | TunnelFrame::ClientClose { .. } => {}
                 }
             }
-            // Hosts don't initiate ClientOpen/Close — they just respond to
-            // whatever phones the relay sends them.
-            TunnelFrame::ClientOpen { .. } | TunnelFrame::ClientClose { .. } => {}
         }
     }
 
-    // Drop OnlineHost so new phones bounce off /v1/client immediately.
-    state.online.lock().await.remove(&host_id);
+    // Cleanup. CRITICAL: only remove our own entry. If we were displaced
+    // (cancel fired), the entry in `online` belongs to the successor and
+    // removing it would silently take the live session offline.
+    {
+        let mut online = state.online.lock().await;
+        let still_ours = online
+            .get(&host_id)
+            .map(|h| h.instance == my_instance)
+            .unwrap_or(false);
+        if still_ours {
+            online.remove(&host_id);
+        }
+    }
     // Closing this drops the outbound queue → writer task exits.
     drop(to_host_tx);
     let _ = writer.await;
@@ -411,7 +526,7 @@ async fn host_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
         let mut map = clients.lock().await;
         map.clear();
     }
-    info!("host offline  id={host_id}");
+    info!("host offline  id={host_id}  instance={my_instance}");
 }
 
 // ============================================================================
@@ -437,7 +552,7 @@ async fn client_ws(
 async fn client_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
     let client_id = uuid::Uuid::new_v4().to_string();
     let (mut sink, mut stream) = ws.split();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<PhoneOut>();
+    let (out_tx, mut out_rx) = mpsc::channel::<PhoneOut>(PER_CLIENT_QUEUE_CAP);
 
     // Snapshot the host's bookkeeping refs. If the host went offline
     // between accept and now, abort cleanly.
@@ -486,7 +601,25 @@ async fn client_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
     let writer_host_id = host_id.clone();
     let writer = tokio::spawn(async move {
         loop {
+            // `biased;` makes the pong arm get polled first on each loop
+            // iteration. It doesn't preempt an in-flight `sink.send().await`
+            // (a future, once entered, runs to completion), but it ensures
+            // that whenever we're between sends and a pong is already
+            // queued, that pong goes out before we start the next video
+            // frame. Combined with the 5s timeout on Binary below, this
+            // keeps phone keepalive responsive even when the link is
+            // congested.
             tokio::select! {
+                biased;
+                maybe_pong = pong_rx.recv() => {
+                    let Some(payload) = maybe_pong else { continue };
+                    let plen = payload.len();
+                    if let Err(e) = sink.send(Message::Pong(payload.into())).await {
+                        warn!("client {writer_client_id}: pong send failed: {e}");
+                        break;
+                    }
+                    info!("client {writer_client_id}: pong sent {plen} bytes");
+                }
                 maybe_out = out_rx.recv() => {
                     let Some(out) = maybe_out else { break };
                     let msg = if out.text {
@@ -497,14 +630,35 @@ async fn client_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
                     } else {
                         Message::Binary(out.bytes.into())
                     };
-                    if sink.send(msg).await.is_err() {
-                        break;
-                    }
-                }
-                maybe_pong = pong_rx.recv() => {
-                    let Some(payload) = maybe_pong else { continue };
-                    if sink.send(Message::Pong(payload.into())).await.is_err() {
-                        break;
+                    // Cap any single send at 15s. With the bounded
+                    // PER_CLIENT_QUEUE_CAP queue dropping surplus video
+                    // frames upstream, this timeout is purely a "kernel
+                    // TCP send buffer is wedged" detector — a healthy 4G
+                    // session, even with brief radio dips, finishes any
+                    // single frame send well under 5s. 15s is below the
+                    // phone's 20s OkHttp pong-timeout (so when we DO
+                    // disconnect, the phone sees a clean WS close instead
+                    // of a confusing "didn't receive pong" error), and
+                    // generous enough that ordinary bufferbloat from a
+                    // brief tower handover doesn't kill the session.
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(15),
+                        sink.send(msg),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            warn!("client {writer_client_id}: send error: {e}");
+                            break;
+                        }
+                        Err(_) => {
+                            warn!(
+                                "client {writer_client_id}: send timed out after 15s \
+                                 (link wedged), disconnecting"
+                            );
+                            break;
+                        }
                     }
                 }
             }
@@ -526,11 +680,15 @@ async fn client_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
             Message::Binary(b) => (false, b.to_vec()),
             Message::Close(_) => break,
             Message::Ping(p) => {
+                info!("client {client_id}: ping {} bytes -> queueing pong", p.len());
                 let _ = pong_tx.send(p.to_vec());
                 continue;
             }
             Message::Pong(_) => continue,
-            _ => continue,
+            other => {
+                warn!("client {client_id}: unexpected message variant {:?}", other);
+                continue;
+            }
         };
         if to_host
             .send(TunnelFrame::Data {

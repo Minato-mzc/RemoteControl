@@ -329,6 +329,30 @@ fn handle_client_msg(
                 );
                 return true;
             }
+            // Relay-mode bandwidth budget. The 30 Mbps default is fine on
+            // the LAN path, but the relay tunnel adds two extra hops
+            // (PC→VPS, VPS→phone) and the limiting factor becomes the
+            // phone's last-mile link rather than PC capture. Clamp to
+            // 5 Mbps and stretch the IDR cadence to 2 s when the peer
+            // arrived via `relay_client::run` (it tags `peer_label` with
+            // a "relay/" prefix). Picture stays crisp; the cap just
+            // prevents a residential uplink + cellular downlink from
+            // building up bufferbloat that would starve the WS keepalive
+            // pongs and trip the phone's 20-second OkHttp pong timeout.
+            // (Earlier 500 kbps + 5 s GOP was a workaround for the HK
+            // cross-border link that frequently dipped under 1 Mbps; not
+            // needed once we moved relay onto a Mainland VPS.)
+            let on_relay = peer_label.starts_with("relay/");
+            let max_bitrate_kbps = if on_relay {
+                Some(max_bitrate_kbps.unwrap_or(30_000).min(5_000))
+            } else {
+                max_bitrate_kbps
+            };
+            let prefer_keyframe_interval_ms = if on_relay {
+                Some(prefer_keyframe_interval_ms.unwrap_or(1_000).max(2_000))
+            } else {
+                prefer_keyframe_interval_ms
+            };
             let params = StreamRequestParams {
                 codec: requested_codec,
                 max_bitrate_kbps,
