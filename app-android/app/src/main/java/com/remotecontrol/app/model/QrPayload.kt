@@ -72,9 +72,6 @@ data class QrPayload(
 
         private fun parseRelay(uri: Uri): QrPayload? {
             val host = uri.host ?: return null
-            // Relay default port is 443 (TLS via caddy/nginx). The PC's
-            // QR may include an explicit port for non-default deploys.
-            val port = uri.port.takeIf { it > 0 } ?: 443
             val version = uri.getQueryParameter("v")?.toIntOrNull() ?: return null
             val code = uri.getQueryParameter("c")?.takeIf { it.isNotBlank() } ?: return null
             val key = uri.getQueryParameter("k")?.takeIf { it.isNotBlank() } ?: return null
@@ -83,11 +80,20 @@ data class QrPayload(
             // `tls` is set by the server based on its configured `base_url`:
             // `https://...` → tls=1 (production caddy/Let's Encrypt deploy),
             // `http://...`  → tls=0 (LAN-only smoke test of the relay
-            // protocol stack against a plain-HTTP relay binary).
+            // protocol stack against a plain-HTTP relay binary, or a
+            // Mainland VPS using a non-standard port without ICP filing).
             // Default to true (TLS) when the param is absent so old QRs
             // generated before this field existed still favor secure
             // transport rather than silently downgrading.
             val tls = uri.getQueryParameter("tls")?.let { it != "0" } ?: true
+            // Port fallback follows the scheme: tls=1 → 443 (https/wss),
+            // tls=0 → 80 (http/ws). Hardcoding 443 here was wrong for
+            // plain-HTTP deploys: `rcrelay://1.2.3.4/?...&tls=0` (no
+            // explicit port) used to dial 443 and time out. The PC side
+            // also injects an explicit port into the QR payload now, but
+            // we still want the parser to do the right thing on its own
+            // for backwards-compatible QRs and edge cases.
+            val port = uri.port.takeIf { it > 0 } ?: if (tls) 443 else 80
             return QrPayload(
                 host = host,
                 port = port,

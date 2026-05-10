@@ -31,9 +31,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{client_async, connect_async, MaybeTlsStream};
 use tracing::{info, warn};
 
 use crate::config::Config;
@@ -287,9 +289,40 @@ impl RelayClient {
         let ws_url = host_ws_url(&self.cfg)?;
         info!("dialing relay  url={ws_url}  host_id={}", self.cfg.host_id);
 
-        let (ws, _resp) = connect_async(&ws_url)
-            .await
-            .with_context(|| format!("relay dial {ws_url}"))?;
+        // For plain `ws://` we manually open the TCP socket and hand it
+        // to `client_async`. Why bother instead of using `connect_async`?
+        // Because `connect_async` resolves the host through whatever
+        // proxy machinery the underlying stack picks up — on Windows
+        // with a system-wide proxy like Clash exporting `HTTP_PROXY=
+        // http://127.0.0.1:7897`, the dial gets steered into that proxy
+        // and silently times out (the proxy refuses to forward to
+        // private/CN IPs in many configurations). Going TCP-direct here
+        // sidesteps any environment proxy lookup entirely so the
+        // launcher script doesn't have to remember to clear half a
+        // dozen env vars on every run. `wss://` still goes through
+        // `connect_async` because we'd otherwise have to wire up rustls
+        // ourselves; production TLS deploys are unlikely to also have a
+        // localhost proxy intercepting their loopback traffic.
+        let (ws, _resp) = if let Some(addr) = parse_ws_authority(&ws_url) {
+            let tcp = TcpStream::connect(&addr)
+                .await
+                .with_context(|| format!("relay tcp connect {addr}"))?;
+            let request = ws_url
+                .as_str()
+                .into_client_request()
+                .with_context(|| format!("build ws request {ws_url}"))?;
+            // Wrap as `MaybeTlsStream::Plain` so the resulting
+            // `WebSocketStream` shape matches `connect_async`'s return
+            // type — needed only because both branches of this if/else
+            // need to assign into the same `(ws, _resp)` binding.
+            client_async(request, MaybeTlsStream::Plain(tcp))
+                .await
+                .with_context(|| format!("relay ws upgrade {ws_url}"))?
+        } else {
+            connect_async(&ws_url)
+                .await
+                .with_context(|| format!("relay dial {ws_url}"))?
+        };
         info!(
             "relay connected  host_id={}  waiting for phone sessions",
             self.cfg.host_id
@@ -441,6 +474,30 @@ impl RelayClient {
 
 /// Convert a `http(s)://relay.example.com` base URL into the WS form
 /// for the long-lived host endpoint, with auth params already included.
+/// If `ws_url` is a plain `ws://host:port/...` URL, return the
+/// `host:port` authority — caller can `TcpStream::connect` to it
+/// directly, bypassing any proxy environment variables that might
+/// otherwise hijack the dial. Returns `None` for `wss://` so the caller
+/// falls back to `connect_async`'s built-in TLS path.
+///
+/// Doesn't validate or canonicalize beyond what the relay's QR
+/// generator already produces; specifically assumes the URL has an
+/// explicit port (which our `qr.rs` guarantees, see
+/// `save_qr_html_and_open` for why).
+fn parse_ws_authority(ws_url: &str) -> Option<String> {
+    let rest = ws_url.strip_prefix("ws://")?;
+    // Keep everything before the first '/' or '?' — that's the authority.
+    let end = rest.find(|c| c == '/' || c == '?').unwrap_or(rest.len());
+    let authority = &rest[..end];
+    if authority.is_empty() || !authority.contains(':') {
+        // No explicit port → can't `TcpStream::connect`. Defer to
+        // `connect_async`, which will fail with a more actionable
+        // error than us guessing at port 80 vs 443.
+        return None;
+    }
+    Some(authority.to_string())
+}
+
 fn host_ws_url(cfg: &RelayConfig) -> Result<String> {
     let base = cfg.base_url.trim_end_matches('/');
     let scheme = if base.starts_with("https://") {
