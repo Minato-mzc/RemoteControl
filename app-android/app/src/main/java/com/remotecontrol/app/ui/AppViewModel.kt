@@ -33,6 +33,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val videoFrames: SharedFlow<VideoFrame> = client.frames
     val audioFrames: SharedFlow<AudioFrame> = client.audioFrames
 
+    /** A/V sync rendezvous shared between H264Player and OpusPlayer. */
+    val avSyncClock = client.avSyncClock
+
     private val _lastInvalidQr = MutableStateFlow(false)
     val lastInvalidQr: StateFlow<Boolean> = _lastInvalidQr.asStateFlow()
 

@@ -331,20 +331,25 @@ fn handle_client_msg(
             }
             // Relay-mode bandwidth budget. The 30 Mbps default is fine on
             // the LAN path, but the relay tunnel adds two extra hops
-            // (PC→VPS, VPS→phone) and the limiting factor becomes the
-            // phone's last-mile link rather than PC capture. Clamp to
-            // 5 Mbps and stretch the IDR cadence to 2 s when the peer
-            // arrived via `relay_client::run` (it tags `peer_label` with
-            // a "relay/" prefix). Picture stays crisp; the cap just
-            // prevents a residential uplink + cellular downlink from
-            // building up bufferbloat that would starve the WS keepalive
-            // pongs and trip the phone's 20-second OkHttp pong timeout.
+            // (PC→VPS, VPS→phone) and the *VPS's outbound* is generally
+            // the tightest link in the chain — Tencent Lighthouse plans
+            // sell 3-5 Mbps outbound for the entry tier, which is also
+            // where most users will land. Clamp to 3 Mbps with a 2 s
+            // GOP, leaving ~25 % headroom over a 4 Mbps VPS for ACKs
+            // and IDR bursts. Going *over* the VPS's outbound rate
+            // causes the relay's kernel TCP send buffer to fill, our
+            // bounded per-phone queue starts dropping P-frames at
+            // insertion time, and the phone's H.264 decoder loses
+            // reference until the next IDR — visible as smearing /
+            // tearing / blocky artifacts for up to one GOP. Keep the
+            // PC's encoder under the VPS ceiling and the artifact
+            // budget collapses to "occasional dropped frame".
             // (Earlier 500 kbps + 5 s GOP was a workaround for the HK
-            // cross-border link that frequently dipped under 1 Mbps; not
-            // needed once we moved relay onto a Mainland VPS.)
+            // cross-border link that frequently dipped under 1 Mbps;
+            // not needed once we moved relay onto a Mainland VPS.)
             let on_relay = peer_label.starts_with("relay/");
             let max_bitrate_kbps = if on_relay {
-                Some(max_bitrate_kbps.unwrap_or(30_000).min(5_000))
+                Some(max_bitrate_kbps.unwrap_or(30_000).min(3_000))
             } else {
                 max_bitrate_kbps
             };

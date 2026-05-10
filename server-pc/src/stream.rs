@@ -112,7 +112,42 @@ impl Drop for StreamHandle {
 }
 
 pub fn start_stream(req: StreamRequestParams) -> Result<StreamHandle> {
-    let cap = DxgiCapture::new()?;
+    // Retry DXGI duplication setup a couple times. When a previous
+    // stream's video loop has just exited (peer disconnect → handle drop
+    // → loop notices stop flag → returns), the underlying COM
+    // `IDXGIOutputDuplication` object can take ~100-300 ms to fully
+    // release inside Windows; if the user mashes "重试" right after a
+    // disconnect, the new `DxgiCapture::new()` lands inside that window
+    // and surfaces as `DuplicateOutput` (Windows reports
+    // `DXGI_ERROR_NOT_CURRENTLY_AVAILABLE` because only one duplication
+    // per output is allowed). A short retry loop hides this from the
+    // user without needing global serialization or a sleep on the disconnect
+    // path.
+    let cap = {
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut out: Option<DxgiCapture> = None;
+        for attempt in 0..5 {
+            match DxgiCapture::new() {
+                Ok(c) => {
+                    out = Some(c);
+                    break;
+                }
+                Err(e) => {
+                    if attempt < 4 {
+                        warn!(
+                            "DxgiCapture::new failed on attempt {}: {e:#} — retrying in 200ms",
+                            attempt + 1
+                        );
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+        out.ok_or_else(|| {
+            last_err.unwrap_or_else(|| anyhow::anyhow!("DxgiCapture::new failed (no error)"))
+        })?
+    };
     let (cap_w, cap_h) = cap.dimensions();
 
     // Plan A: encode at native capture resolution (1080p). The 720p

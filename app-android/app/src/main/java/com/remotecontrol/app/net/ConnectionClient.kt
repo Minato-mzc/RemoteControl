@@ -43,10 +43,21 @@ class ConnectionClient(
      * Inbound video frames. Backed by a SharedFlow that drops oldest on
      * buffer overflow — losing the occasional frame when the decoder lags is
      * far better than blocking the WebSocket reader.
+     *
+     * The buffer has to be wide enough to hold a full IDR + a few P-frames
+     * for the brief window between `streamStarted` arriving (which is when
+     * StreamSurface composes) and the actual `frames.collect` LaunchedEffect
+     * starting up. Without it — or with the previous capacity of 8 frames —
+     * a fast PC encoder running at 30 fps would emit 8+ frames before
+     * Compose finished mounting, the buffer would DROP_OLDEST through the
+     * IDR, and the decoder would be stuck waiting for the next GOP boundary
+     * (up to 2 s) before it could decode anything. 32 frames at 30 fps
+     * gives ~1 s of headroom — comfortable buffer for any reasonable Compose
+     * mount, while still bounded so a hung decoder can't OOM us.
      */
     private val _frames = MutableSharedFlow<VideoFrame>(
         replay = 0,
-        extraBufferCapacity = 8,
+        extraBufferCapacity = 32,
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
     )
     val frames: SharedFlow<VideoFrame> = _frames.asSharedFlow()
@@ -63,6 +74,23 @@ class ConnectionClient(
 
     /** Cumulative count of binary video frames received, exposed for UI debug overlay. */
     val receivedFrameCount = AtomicLong(0)
+
+    /**
+     * A/V sync rendezvous. OpusPlayer publishes the wall-clock + source-PTS
+     * of the first audible audio sample here; H264Player reads it on the
+     * first decoded frame and aligns its render-clock origin to match, so
+     * audio and video for the same source moment land at the same wall
+     * time. Lifetime is bound to the client itself; we just `reset()` on
+     * each new stream session via [resetAvSyncForNewStream].
+     */
+    val avSyncClock = com.remotecontrol.app.video.AvSyncClock()
+
+    /** Wipe any previously published audio start time. Called when a fresh
+     *  stream session begins so a stale timestamp from the prior session
+     *  doesn't anchor the new one. */
+    fun resetAvSyncForNewStream() {
+        avSyncClock.reset()
+    }
 
     private var webSocket: WebSocket? = null
     private var pendingNonce: ByteArray = ByteArray(0)
@@ -394,6 +422,12 @@ class ConnectionClient(
 
     private fun handleStreamStarted(msg: StreamStarted) {
         val cur = _state.value as? ConnectionState.Connected ?: return
+        // Wipe stale A/V sync data before the new stream's first audio sample
+        // arrives. If we left the previous session's value in place,
+        // OpusPlayer's idempotent publishAudioStart would silently no-op for
+        // this session and H264Player would lock to a wall-clock reference
+        // from the *previous* connection — A/V would drift wildly.
+        resetAvSyncForNewStream()
         val audio = msg.audio?.let { dto ->
             AudioStreamInfo(
                 codec = dto.codec,

@@ -57,6 +57,7 @@ fun StreamSurface(
     modifier: Modifier = Modifier,
 ) {
     val player = remember(stream.streamId) { H264Player() }
+    val avSync = androidx.lifecycle.viewmodel.compose.viewModel<com.remotecontrol.app.ui.AppViewModel>().avSyncClock
     var surfaceReady by remember(stream.streamId) { mutableStateOf(false) }
     var initError by remember(stream.streamId) { mutableStateOf<String?>(null) }
     val density = LocalDensity.current
@@ -79,7 +80,13 @@ fun StreamSurface(
                             height: Int,
                         ) {
                             val mime = videoMimeFor(stream.codec)
-                            val r = player.start(Surface(st), mime, stream.width, stream.height)
+                            val r = player.start(
+                                Surface(st),
+                                mime,
+                                stream.width,
+                                stream.height,
+                                avSync,
+                            )
                             if (r.isFailure) {
                                 initError = r.exceptionOrNull()?.message ?: "codec init failed"
                             } else {
@@ -125,8 +132,22 @@ fun StreamSurface(
         }
     }
 
-    LaunchedEffect(stream.streamId, surfaceReady) {
-        if (!surfaceReady) return@LaunchedEffect
+    // Subscribe to frames the moment the composable enters — do NOT wait
+    // for `surfaceReady`. The first IDR usually arrives within 100-300 ms
+    // of the WS `streamStarted` reply, but the TextureView's
+    // SurfaceTexture often isn't usable until 500 ms+ later (it depends on
+    // Compose layout, GPU surface allocation, and `MediaCodec.start()`
+    // returning). If we waited, the first IDR was emitted into a
+    // SharedFlow with no subscribers and silently dropped (replay=0); the
+    // decoder then sat idle for one GOP — up to 2 s — until the next IDR
+    // arrived. Result: 3-5 s of black screen on every reconnect.
+    //
+    // Instead: subscribe immediately, hand frames to the player. The
+    // player buffers them into `pendingFrames` while `codec == null`, and
+    // drains the queue once `start()` fires. Net effect: as soon as the
+    // codec is up, it gets the first IDR without waiting for the next
+    // GOP boundary.
+    LaunchedEffect(stream.streamId) {
         frames.collect { frame -> player.feed(frame) }
     }
 }
@@ -143,8 +164,9 @@ fun AudioPlaybackEffect(
     frames: SharedFlow<AudioFrame>,
 ) {
     val player = remember(audio) { OpusPlayer() }
+    val avSync = androidx.lifecycle.viewmodel.compose.viewModel<com.remotecontrol.app.ui.AppViewModel>().avSyncClock
     DisposableEffect(audio) {
-        player.start(audio)
+        player.start(audio, avSync)
         onDispose { player.stop() }
     }
     LaunchedEffect(audio, frames) {
