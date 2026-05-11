@@ -175,10 +175,19 @@ private fun ExpandedPanel(
             KKey("PgDn") { onKeyTap(VKey.NEXT) }
             Spacer(Modifier.width(4.dp))
             KKey("Win") { onKeyTap(VKey.LWIN) }
+            // PrintScreen — full-screen → clipboard. Most users prefer
+            // the Win+Shift+S macro in the row below (region selector);
+            // we keep PrtSc here for muscle-memory and edge cases like
+            // full-screen game capture where Win+Shift+S doesn't work.
             KKey("PrtSc") { onKeyTap(VKey.SNAPSHOT) }
             FKeyMenu(onKeyTap)
             Spacer(Modifier.width(4.dp))
-            KIcon(Icons.Default.ContentCopy) {
+            // Two clipboard directions. The previous icon-only buttons
+            // (ContentCopy / ContentPaste) looked nearly identical at the
+            // panel's small button size — users couldn't tell which way
+            // was which without trial-and-error. Replaced with explicit
+            // text labels.
+            KKey("复制到 PC") {
                 val text = readPhoneClipboard(context)
                 if (text.isNotEmpty()) {
                     onClipboardPush(text)
@@ -187,7 +196,7 @@ private fun ExpandedPanel(
                     Toast.makeText(context, "手机剪贴板为空", Toast.LENGTH_SHORT).show()
                 }
             }
-            KIcon(Icons.Default.ContentPaste) { onClipboardPull() }
+            KKey("复制到手机") { onClipboardPull() }
         }
 
         // Macro row: common Windows shortcuts in one tap.

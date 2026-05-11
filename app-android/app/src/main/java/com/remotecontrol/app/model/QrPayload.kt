@@ -73,42 +73,39 @@ data class QrPayload(
             val version = uri.getQueryParameter("v")?.toIntOrNull() ?: return null
             val code = uri.getQueryParameter("c")?.takeIf { it.isNotBlank() } ?: return null
             val key = uri.getQueryParameter("k")?.takeIf { it.isNotBlank() } ?: return null
-            // Combined-QR extension: optional `relay=<authority>;<host_id>;<tls>`
-            // query param. Older app builds and pure-LAN QRs simply
-            // skip this; newer builds use it as a fallback dial when
-            // the LAN endpoint isn't reachable.
-            val relayParam = uri.getQueryParameter("relay")
-            val fallback = relayParam?.let { parseRelayTuple(it, version, code, key) }
+            // Combined-QR extension: optional `rh`/`rid`/`rtls` query
+            // params describe the relay fallback. Older app builds and
+            // pure-LAN QRs simply skip this; newer builds use it as a
+            // fallback dial when the LAN endpoint is unreachable.
+            // (Earlier iteration packed the three values into a single
+            // `relay=AUTH;ID;TLS` value but some Android URI parsers
+            // treat `;` as a parameter delimiter and silently lost the
+            // tail — three flat params dodge the issue.)
+            val rh = uri.getQueryParameter("rh")?.takeIf { it.isNotBlank() }
+            val rid = uri.getQueryParameter("rid")?.takeIf { it.isNotBlank() }
+            val rtls = uri.getQueryParameter("rtls")
+            val fallback = buildFallback(rh, rid, rtls, version, code, key)
             return QrPayload(host, port, code, key, version, fallback = fallback)
         }
 
-        /**
-         * Decode the `relay=` query value emitted by the PC's
-         * [build_combined_payload]. Format:
-         * `<authority>;<host_id>;<tls_flag>`, e.g.
-         * `150.158.45.221:8443;abc-uuid;0`. Returns null for any
-         * shape that doesn't parse — the caller treats it as "no
-         * fallback, LAN only".
-         */
-        private fun parseRelayTuple(
-            raw: String,
+        private fun buildFallback(
+            rh: String?,
+            rid: String?,
+            rtls: String?,
             version: Int,
             code: String,
             key: String,
         ): QrPayload? {
-            val parts = raw.split(";")
-            if (parts.size != 3) return null
-            val authority = parts[0].takeIf { it.isNotBlank() } ?: return null
-            val hostId = parts[1].takeIf { it.isNotBlank() } ?: return null
-            val tls = parts[2] != "0"
-            val (host, port) = parseAuthority(authority, tls) ?: return null
+            if (rh == null || rid == null) return null
+            val tls = rtls != "0"
+            val (rHost, rPort) = parseAuthority(rh, tls) ?: return null
             return QrPayload(
-                host = host,
-                port = port,
+                host = rHost,
+                port = rPort,
                 code = code,
                 keyB64Url = key,
                 version = version,
-                relayHostId = hostId,
+                relayHostId = rid,
                 secure = tls,
             )
         }

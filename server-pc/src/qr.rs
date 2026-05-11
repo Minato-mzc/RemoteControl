@@ -21,16 +21,20 @@ pub fn build_payload(host: &str, port: u16, code: &str, key_b64url: &str) -> Str
 /// optional relay fallback. Phones with up-to-date app code try LAN
 /// first and fall back to relay if LAN is unreachable (cross-network).
 /// Older phones see `rc://` and parse only the LAN part; the unknown
-/// `relay=` query param is ignored, so backwards compatibility holds
-/// for same-network usage.
+/// `rh/rid/rtls` query params are ignored, so backwards compatibility
+/// holds for same-network usage.
 ///
-/// Format: `rc://<lan_host>:<lan_port>/?v=N&c=CODE&k=KEY&relay=<authority>;<host_id>;<tls_flag>`
-///   - `<authority>` is `host:port` (e.g. `150.158.45.221:8443`)
-///   - `<host_id>` is the relay-assigned UUID
-///   - `<tls_flag>` is `1` for wss / `0` for ws
-/// Semicolon separator (not `,` or `&`) because we keep the entire
-/// relay tuple in a single query value — Uri parsers see it as one
-/// opaque string.
+/// Format:
+/// `rc://<lan_host>:<lan_port>/?v=N&c=CODE&k=KEY&rh=<authority>&rid=<host_id>&rtls=<flag>`
+///
+/// We use *three independent* query params (`rh`, `rid`, `rtls`)
+/// rather than one packed string. Earlier attempts at packing the
+/// triple into a single value with `;` separators bit us on some
+/// Android URI parsers that treat `;` as a secondary query-param
+/// delimiter — `getQueryParameter("relay")` returned only the first
+/// segment and the rest of the tuple silently vanished, leaving the
+/// phone with no usable fallback. Three flat params dodge the issue
+/// entirely.
 pub fn build_combined_payload(
     lan_host: &str,
     lan_port: u16,
@@ -46,9 +50,6 @@ pub fn build_combined_payload(
         .trim_start_matches("https://")
         .trim_start_matches("http://")
         .trim_end_matches('/');
-    // Always include an explicit port (same reasoning as the standalone
-    // `rcrelay://` path: Android URI parser surfaces -1 for missing
-    // port and we don't want it to guess wrong).
     let authority = if stripped.contains(':') {
         stripped.to_string()
     } else {
@@ -56,7 +57,10 @@ pub fn build_combined_payload(
         format!("{stripped}:{default_port}")
     };
     let tls = if scheme_is_https { 1 } else { 0 };
-    format!("{base}&relay={authority};{host_id};{tls}", host_id = r.host_id)
+    format!(
+        "{base}&rh={authority}&rid={host_id}&rtls={tls}",
+        host_id = r.host_id,
+    )
 }
 
 pub fn print_qr_to_terminal(host: &str, port: u16, code: &str, key_b64url: &str) -> Result<()> {

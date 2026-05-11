@@ -513,6 +513,14 @@ class ConnectionClient(
     companion object {
         private fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
             .pingInterval(20.seconds.inWholeMilliseconds, java.util.concurrent.TimeUnit.MILLISECONDS)
+            // Connect timeout 4s (default 10s) so a combined-QR scan
+            // doesn't hang for a full 10 seconds when the LAN address
+            // is unreachable. The phone-side relay fallback in
+            // `onFailure` then kicks in within ~4s instead of ~10s.
+            // 4s is comfortably more than typical LAN dial RTT (sub-50ms
+            // intra-router) plus DNS, so we don't false-trip on healthy
+            // connections.
+            .connectTimeout(4, java.util.concurrent.TimeUnit.SECONDS)
             .build()
 
         private fun base64Url(bytes: ByteArray): String =
