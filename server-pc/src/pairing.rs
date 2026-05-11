@@ -73,8 +73,9 @@ impl PairingStore {
         VerifyResult::Ok
     }
 
-    /// Rotate to a new code (e.g. after a failed/expired session, or on user request).
-    #[allow(dead_code)]
+    /// Rotate to a new code (e.g. after a failed/expired session, or on
+    /// user request). The CLI listener in `lib.rs` calls this on Enter
+    /// so the user can mint a fresh code without restarting the server.
     pub fn rotate(&self) {
         let mut rng = rand::thread_rng();
         let mut g = self.inner.lock().unwrap();

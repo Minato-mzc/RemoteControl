@@ -105,6 +105,19 @@ class ConnectionClient(
      *  decide which payload to emit. */
     private var pendingHello: HelloPayload? = null
 
+    /** Optional second-chance dial target — populated from
+     *  [QrPayload.fallback] when the scanned QR was the combined LAN+relay
+     *  shape. On the FIRST `onFailure` from the primary dial we retry
+     *  here exactly once; if that also fails we surface the error
+     *  normally. Set to null once consumed so a subsequent failure isn't
+     *  silently swallowed. */
+    private var pendingFallback: QrPayload? = null
+    /** Device name the user chose at scan time. Carried alongside
+     *  `pendingFallback` so the retry can reconstruct a fresh
+     *  `HelloPayload.Qr` (with its own nonce — the previous one was
+     *  consumed when we opened the WS). */
+    private var pendingFallbackDeviceName: String = ""
+
     /** When QR pairing succeeds and the Welcome carries a fresh
      *  trust_token, we drop a [TrustedServer] here so the ViewModel can
      *  persist it. We keep persistence out of the network layer because
@@ -143,6 +156,12 @@ class ConnectionClient(
         pendingNonce = nonce
         pendingWsUrl = payload.wsUrl
         pendingHello = HelloPayload.Qr(payload.code, nonce, deviceName)
+        // Stash the relay fallback (if the QR was the combined LAN+relay
+        // shape). The Listener.onFailure handler consumes it on the
+        // first primary-dial failure so the user gets one automatic
+        // retry against the relay before seeing an error screen.
+        pendingFallback = payload.fallback
+        pendingFallbackDeviceName = deviceName
 
         val req = Request.Builder().url(payload.wsUrl).build()
         webSocket = http.newWebSocket(req, Listener())
@@ -368,6 +387,22 @@ class ConnectionClient(
 
         override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
             Log.w(TAG, "ws failed", t)
+            // Combined-QR fallback: if the scanned QR carried both a LAN
+            // primary and a relay backup, consume the backup exactly
+            // once and retry the dial against it. Typical use: user is
+            // off-LAN (4G / different Wi-Fi), LAN host is unreachable,
+            // we silently switch to the relay path so they don't have
+            // to scan again or know which network they're on.
+            val fb = pendingFallback
+            if (fb != null) {
+                pendingFallback = null
+                Log.i(TAG, "primary dial failed; retrying via relay fallback ${fb.wsUrl}")
+                webSocket = null
+                // Reuse `connect` so all the per-dial state (key, nonce,
+                // pendingHello) gets re-initialised cleanly.
+                connect(fb, pendingFallbackDeviceName)
+                return
+            }
             _state.value = ConnectionState.Failed(t.message ?: "连接失败")
             webSocket = null
         }

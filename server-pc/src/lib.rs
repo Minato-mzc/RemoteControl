@@ -14,6 +14,7 @@ pub mod net;
 pub mod pairing;
 pub mod protocol;
 pub mod qr;
+pub mod qr_server;
 pub mod relay_client;
 pub mod stream;
 pub mod trusted_devices;
@@ -122,27 +123,24 @@ pub async fn run_server(mode: ServerMode) -> Result<()> {
         base_url: r.base_url.as_str(),
         host_id: r.host_id.as_str(),
     });
-    // Render the HTML page even in RelayOnly mode so the user has a
-    // visible QR for their phone to scan.
+    // Spin up the local QR HTTP server (port = WS port + 1 by default)
+    // and open the browser there. The page contains a "🔄 刷新二维码"
+    // button that hits the server's `/refresh` endpoint to rotate the
+    // pairing code without restarting the process — nice when the
+    // 5-minute TTL lapses mid-setup.
     let render_html = matches!(
         mode,
         ServerMode::LanOnly | ServerMode::LanAndRelay | ServerMode::RelayOnly
     );
+    let qr_http_port = port.saturating_add(1);
     if render_html {
-        let lan_addrs_for_html: &[net::DiscoveredAddr] = match mode {
-            ServerMode::RelayOnly => &[],
-            _ => &addrs,
-        };
-        match qr::save_qr_html_and_open(
-            lan_addrs_for_html,
-            port,
-            &code,
-            &key_b64,
-            relay_qr_info.as_ref(),
-        ) {
-            Ok(path) => info!("QR HTML written and opened: {}", path.display()),
-            Err(e) => warn!("could not write QR HTML: {e:#}"),
-        }
+        // Suppress the unused-warning when both `code` and `key_b64` are
+        // not needed here anymore (the QR HTTP server reads fresh values
+        // from `pairing` on each request).
+        let _ = (&code, &key_b64);
+        let qr_url = format!("http://127.0.0.1:{qr_http_port}/");
+        open_in_default_browser(&qr_url);
+        info!("QR page: {qr_url} (will open in your browser shortly)");
     }
     if let Some(rcfg) = &relay_cfg {
         let authority = rcfg
@@ -189,8 +187,41 @@ pub async fn run_server(mode: ServerMode) -> Result<()> {
             futures_util::future::pending::<Result<()>>().await
         }
     };
+    let qr_http_fut = async {
+        if render_html {
+            qr_server::run(qr_server::QrServerArgs {
+                bind_addr: format!("127.0.0.1:{qr_http_port}"),
+                pairing: pairing.clone(),
+                addrs: addrs.clone(),
+                port,
+                relay_cfg: relay_cfg.clone(),
+                mode,
+            })
+            .await
+        } else {
+            futures_util::future::pending::<Result<()>>().await
+        }
+    };
     tokio::select! {
         r = lan_fut => r,
         r = relay_fut => r,
+        r = qr_http_fut => r,
     }
+}
+
+#[cfg(target_os = "windows")]
+fn open_in_default_browser(url: &str) {
+    // `cmd /C start "" <url>` opens the URL in the system default
+    // browser. Empty quoted arg is a CMD quirk: without it, `start`
+    // treats the next quoted token as a window title rather than as the
+    // target to open.
+    let _ = std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn();
+}
+
+#[cfg(not(target_os = "windows"))]
+fn open_in_default_browser(_url: &str) {
+    // Not currently wired on non-Windows builds; user can navigate
+    // there manually if needed.
 }

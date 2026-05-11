@@ -17,6 +17,48 @@ pub fn build_payload(host: &str, port: u16, code: &str, key_b64url: &str) -> Str
     )
 }
 
+/// Build a *combined* QR payload that encodes a LAN endpoint AND an
+/// optional relay fallback. Phones with up-to-date app code try LAN
+/// first and fall back to relay if LAN is unreachable (cross-network).
+/// Older phones see `rc://` and parse only the LAN part; the unknown
+/// `relay=` query param is ignored, so backwards compatibility holds
+/// for same-network usage.
+///
+/// Format: `rc://<lan_host>:<lan_port>/?v=N&c=CODE&k=KEY&relay=<authority>;<host_id>;<tls_flag>`
+///   - `<authority>` is `host:port` (e.g. `150.158.45.221:8443`)
+///   - `<host_id>` is the relay-assigned UUID
+///   - `<tls_flag>` is `1` for wss / `0` for ws
+/// Semicolon separator (not `,` or `&`) because we keep the entire
+/// relay tuple in a single query value — Uri parsers see it as one
+/// opaque string.
+pub fn build_combined_payload(
+    lan_host: &str,
+    lan_port: u16,
+    code: &str,
+    key_b64url: &str,
+    relay: Option<&RelayQrInfo<'_>>,
+) -> String {
+    let base = build_payload(lan_host, lan_port, code, key_b64url);
+    let Some(r) = relay else { return base };
+    let scheme_is_https = r.base_url.starts_with("https://");
+    let stripped = r
+        .base_url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    // Always include an explicit port (same reasoning as the standalone
+    // `rcrelay://` path: Android URI parser surfaces -1 for missing
+    // port and we don't want it to guess wrong).
+    let authority = if stripped.contains(':') {
+        stripped.to_string()
+    } else {
+        let default_port = if scheme_is_https { 443 } else { 80 };
+        format!("{stripped}:{default_port}")
+    };
+    let tls = if scheme_is_https { 1 } else { 0 };
+    format!("{base}&relay={authority};{host_id};{tls}", host_id = r.host_id)
+}
+
 pub fn print_qr_to_terminal(host: &str, port: u16, code: &str, key_b64url: &str) -> Result<()> {
     let payload = build_payload(host, port, code, key_b64url);
     let qr = QrCode::new(payload.as_bytes())?;
@@ -51,13 +93,18 @@ pub struct RelayQrInfo<'a> {
 /// optionally one for the configured relay). The user scans whichever
 /// tile matches where the phone is — home Wi-Fi, phone hotspot, or
 /// cross-network via relay. Auto-opens in the default browser.
-pub fn save_qr_html_and_open(
+/// Build the QR HTML page as a string without writing to disk. Used by
+/// [`save_qr_html_and_open`] (file-based path, kept for backwards
+/// compatibility) and by `qr_server` (serves it dynamically over HTTP
+/// so the in-browser refresh button can re-render with a fresh pairing
+/// code without restarting the server).
+pub fn build_qr_html(
     addrs: &[DiscoveredAddr],
     port: u16,
     code: &str,
     key_b64url: &str,
     relay: Option<&RelayQrInfo<'_>>,
-) -> Result<PathBuf> {
+) -> Result<String> {
     if addrs.is_empty() && relay.is_none() {
         anyhow::bail!("no LAN address candidates and no relay configured");
     }
@@ -77,105 +124,86 @@ pub fn save_qr_html_and_open(
         physical
     };
 
+    // ONE combined card with ONE QR.
+    //
+    // Strategy:
+    //   * Pick the best LAN address (first physical NIC) as the primary
+    //     endpoint encoded in the `rc://` authority.
+    //   * If a relay is configured, append it as `&relay=...` in the
+    //     query string so newer phone builds can fall back when LAN is
+    //     unreachable (cross-network case).
+    //   * Older phone builds parse `rc://` as before — they get LAN
+    //     only, which works in the same-Wi-Fi case anyway.
+    //
+    // If there are *no* LAN addresses (RelayOnly mode), we synthesize a
+    // pseudo-host of `0.0.0.0:0` so the URI still parses cleanly; the
+    // phone will detect that, ignore the LAN dial entirely, and go
+    // straight to the relay.
     let mut tiles = String::new();
-    for a in visible {
-        let payload = build_payload(&a.addr.to_string(), port, code, key_b64url);
-        let qr = QrCode::new(payload.as_bytes()).context("build QR")?;
-        let svg_xml = qr
-            .render::<svg::Color>()
-            .min_dimensions(280, 280)
-            .quiet_zone(true)
-            .dark_color(svg::Color("#000000"))
-            .light_color(svg::Color("#ffffff"))
-            .build();
-
-        let (kind_label, kind_class) = match a.kind {
-            InterfaceKind::Physical => ("物理网卡", "ok"),
-            InterfaceKind::Unknown => ("未知类型", "warn"),
-            InterfaceKind::Virtual => ("虚拟网卡（手机一般不可达）", "bad"),
-        };
-
-        let _ = write!(
-            &mut tiles,
-            r##"<div class="card">
-                  <div class="qr">{svg_xml}</div>
-                  <div class="ip">{ip}:{port}</div>
-                  <div class="iface {kind_class}">{iface} · {kind_label}</div>
-                  <div class="meta">{payload}</div>
-                </div>"##,
-            svg_xml = svg_xml,
-            ip = a.addr,
-            port = port,
-            iface = html_escape(&a.iface_name),
-            kind_label = kind_label,
-            kind_class = kind_class,
-            payload = html_escape(&payload),
-        );
-    }
-
-    // Optional cross-network card. Different label/border-color so the
-    // user can tell at a glance which is for "same Wi-Fi" and which is
-    // "different network" — the latter is meant for when scanning the
-    // LAN cards is impossible (4G, hotel Wi-Fi, etc.).
-    if let Some(r) = relay {
-        // Strip the scheme for display + payload: `rcrelay://<host>/?...`
-        // expects a host:port-style authority, not a full https:// URL.
-        // Whether the phone should dial via wss:// (TLS) or plain ws:// is
-        // captured in the `tls` query param — derived from the configured
-        // base_url. Default deploys put caddy/Let's Encrypt in front and
-        // use `https://` (so tls=1); local-LAN test rigs running the
-        // relay binary plain on `:7891` use `http://` (tls=0). The phone
-        // can't sniff this from the URL alone.
-        let scheme_is_https = r.base_url.starts_with("https://");
-        let stripped = r
-            .base_url
-            .trim_start_matches("https://")
-            .trim_start_matches("http://")
-            .trim_end_matches('/');
-        // ALWAYS emit an explicit port in the authority. If `base_url` was
-        // typed without a port (e.g. `http://1.2.3.4`), Android's URI
-        // parser surfaces port=-1 and the QrPayload Kotlin parser then
-        // falls back to its own default (443). That default is wrong for
-        // a plain-HTTP relay on :80 — the phone would dial 443, hang,
-        // time out, fail. Inject the scheme's default port here so the
-        // QR carries unambiguous host:port either way.
-        let authority = if stripped.contains(':') {
-            stripped.to_string()
+    let (primary_addr_str, primary_iface_kind, primary_iface_name) =
+        if let Some(first) = visible.first() {
+            (first.addr.to_string(), first.kind, first.iface_name.clone())
         } else {
-            let default_port = if scheme_is_https { 443 } else { 80 };
-            format!("{stripped}:{default_port}")
+            ("0.0.0.0".to_string(), InterfaceKind::Unknown, String::from("relay-only"))
         };
-        let tls = if scheme_is_https { 1 } else { 0 };
-        let payload = format!(
-            "rcrelay://{authority}/?host={host}&v={v}&c={code}&k={key}&tls={tls}",
-            authority = authority,
-            host = r.host_id,
-            v = PROTOCOL_VERSION,
-            code = code,
-            key = key_b64url,
-            tls = tls,
-        );
-        let qr = QrCode::new(payload.as_bytes()).context("build relay QR")?;
-        let svg_xml = qr
-            .render::<svg::Color>()
-            .min_dimensions(280, 280)
-            .quiet_zone(true)
-            .dark_color(svg::Color("#1f4d8b"))
-            .light_color(svg::Color("#ffffff"))
-            .build();
-        let _ = write!(
-            &mut tiles,
-            r##"<div class="card relay">
-                  <div class="qr">{svg_xml}</div>
-                  <div class="ip">{authority}</div>
-                  <div class="iface relay-tag">跨网络中继 · 不同 Wi-Fi / 4G/5G 时使用</div>
-                  <div class="meta">{payload}</div>
-                </div>"##,
-            svg_xml = svg_xml,
-            authority = html_escape(&authority),
-            payload = html_escape(&payload),
-        );
-    }
+    let payload = build_combined_payload(
+        &primary_addr_str,
+        port,
+        code,
+        key_b64url,
+        relay,
+    );
+    let qr = QrCode::new(payload.as_bytes()).context("build combined QR")?;
+    let svg_xml = qr
+        .render::<svg::Color>()
+        .min_dimensions(320, 320)
+        .quiet_zone(true)
+        .dark_color(svg::Color("#000000"))
+        .light_color(svg::Color("#ffffff"))
+        .build();
+
+    // Display string for the card subtitle.
+    let lan_display = format!("{primary_addr_str}:{port}");
+    let relay_display = relay
+        .map(|r| {
+            let stripped = r
+                .base_url
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .trim_end_matches('/');
+            stripped.to_string()
+        })
+        .unwrap_or_default();
+    let (kind_label, kind_class) = match primary_iface_kind {
+        InterfaceKind::Physical => ("物理网卡", "ok"),
+        InterfaceKind::Unknown => ("--", "warn"),
+        InterfaceKind::Virtual => ("虚拟网卡", "bad"),
+    };
+
+    let _ = write!(
+        &mut tiles,
+        r##"<div class="card combo">
+              <div class="qr">{svg_xml}</div>
+              <div class="ip">{lan_display}</div>
+              <div class="iface {kind_class}">{iface} · {kind_label}</div>
+              {relay_line}
+              <div class="meta">{payload}</div>
+            </div>"##,
+        svg_xml = svg_xml,
+        lan_display = html_escape(&lan_display),
+        iface = html_escape(&primary_iface_name),
+        kind_class = kind_class,
+        kind_label = kind_label,
+        relay_line = if relay.is_some() {
+            format!(
+                r##"<div class="iface relay-tag">跨网络中继: {}</div>"##,
+                html_escape(&relay_display)
+            )
+        } else {
+            String::new()
+        },
+        payload = html_escape(&payload),
+    );
 
     let html = format!(
         r##"<!doctype html>
@@ -212,8 +240,14 @@ pub fn save_qr_html_and_open(
 </head>
 <body>
   <h1>RemoteControl 配对</h1>
-  <p>用手机 App 扫和你当前网络对应的那张二维码</p>
+  <p>手机 App 扫这一个二维码即可，连接路径自动选择（同 WiFi 走 LAN，否则走中继）</p>
   <div>配对码 <span class="code">{code}</span> · 5 分钟有效，单次使用</div>
+  <p style="margin-top: 14px;">
+    <a href="/refresh"
+       style="display: inline-block; padding: 8px 18px; border-radius: 999px;
+              background: #1f4d8b; color: #fff; text-decoration: none;
+              font-size: 13px; font-weight: 600;">🔄 刷新二维码</a>
+  </p>
   <div class="grid">{tiles}</div>
 </body>
 </html>"##,
@@ -221,11 +255,24 @@ pub fn save_qr_html_and_open(
         tiles = tiles,
     );
 
+    Ok(html)
+}
+
+/// File-based renderer kept around for the no-HTTP-server fallback
+/// (mostly relevant in tests or LAN-only smoke checks). New code paths
+/// should use [`build_qr_html`] + serve it via `qr_server`.
+pub fn save_qr_html_and_open(
+    addrs: &[DiscoveredAddr],
+    port: u16,
+    code: &str,
+    key_b64url: &str,
+    relay: Option<&RelayQrInfo<'_>>,
+) -> Result<PathBuf> {
+    let html = build_qr_html(addrs, port, code, key_b64url, relay)?;
     let path = std::env::current_dir()
         .context("get cwd")?
         .join("qrcode.html");
     std::fs::write(&path, html).with_context(|| format!("write {}", path.display()))?;
-
     open_in_default_app(&path);
     Ok(path)
 }
