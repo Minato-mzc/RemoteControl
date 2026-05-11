@@ -28,6 +28,27 @@ import kotlin.time.Duration.Companion.seconds
 
 private const val TAG = "RC/WS"
 
+/** M6: chunk size for outbound file uploads. 256 KiB hits the sweet
+ *  spot — large enough that the per-frame header cost (12 bytes) is
+ *  negligible and that fewer than ~100 frames cross the wire per MiB,
+ *  small enough that the okhttp send queue doesn't accumulate unbounded
+ *  memory while a slow link drains. */
+private const val CHUNK_BYTES = 256 * 1024
+
+/** Lifecycle events for an in-flight upload. Subscribed by the UI to
+ *  render progress and Toasts. */
+sealed interface FileTransferEvent {
+    val id: Int
+    data class Accepted(override val id: Int, val destPath: String) : FileTransferEvent
+    data class Progress(
+        override val id: Int,
+        val bytesSent: Long,
+        val totalBytes: Long,
+    ) : FileTransferEvent
+    data class Complete(override val id: Int, val destPath: String) : FileTransferEvent
+    data class Failed(override val id: Int, val reason: String) : FileTransferEvent
+}
+
 /**
  * Owns a single WebSocket to the PC server. Handles pairing handshake, the
  * stream control sub-protocol, and exposes the inbound binary video frames
@@ -298,6 +319,104 @@ class ConnectionClient(
     )
     val clipboardFromPc: SharedFlow<String> = _clipboardFromPc.asSharedFlow()
 
+    /** M6: notifications from the file-transfer pipeline. UI subscribes
+     *  to display progress / Toast on completion. */
+    private val _fileEvents = MutableSharedFlow<FileTransferEvent>(
+        replay = 0,
+        extraBufferCapacity = 16,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+    val fileEvents: SharedFlow<FileTransferEvent> = _fileEvents.asSharedFlow()
+
+    /**
+     * Stream a file from the phone to the PC. Caller provides:
+     *   * `name`  — filename to suggest on the PC side (sanitised server-side).
+     *   * `size`  — total byte count for progress UI; server checks against
+     *     actual bytes received and warns on mismatch.
+     *   * `open`  — opens a fresh `InputStream` over the file. Wrapped in
+     *     a closure so the caller doesn't have to hold a file handle
+     *     open while we await the WS ack.
+     *
+     * Flow:
+     *   1) Send `FileTransferBegin` with a fresh u32 id.
+     *   2) Read the file in 256 KiB chunks; for each, send a binary
+     *      frame with `frame_type=FILE`. The final chunk has
+     *      `LAST_CHUNK` set.
+     *   3) Server emits `FileTransferAccepted` on (1) and
+     *      `FileTransferComplete` after the last chunk lands.
+     *
+     * Returns the transfer id so the UI can correlate events.
+     */
+    fun uploadFile(
+        name: String,
+        size: Long,
+        open: () -> java.io.InputStream,
+    ): Int {
+        val ws = webSocket ?: run {
+            Log.w(TAG, "uploadFile: no active websocket")
+            return -1
+        }
+        val id = nextTransferId.getAndIncrement()
+        ws.send(ProtoJson.encodeToString(
+            ClientMsg.serializer(),
+            FileTransferBegin(id = id, name = name, size = size),
+        ))
+        // Stream in a background thread — chunking + WS send must not
+        // block whichever main/IO scope called us. okhttp WebSocket.send
+        // is already non-blocking (queues internally) but reading from
+        // the file is.
+        Thread({
+            try {
+                open().use { input ->
+                    val buf = ByteArray(CHUNK_BYTES)
+                    var seq = 0
+                    var totalSent = 0L
+                    while (true) {
+                        val n = input.read(buf)
+                        if (n <= 0) {
+                            // EOF — send a zero-length terminator with
+                            // the LAST flag so the server flushes + closes.
+                            val frame = buildFileChunkFrame(
+                                transferId = id,
+                                chunkSeq = seq,
+                                last = true,
+                                payload = ByteArray(0),
+                            )
+                            ws.send(ByteString.of(*frame))
+                            break
+                        }
+                        val chunk = if (n == buf.size) buf else buf.copyOf(n)
+                        // If we hit EOF exactly on a chunk boundary the
+                        // next read returned -1 above; otherwise we flag
+                        // LAST when this is the tail.
+                        val frame = buildFileChunkFrame(
+                            transferId = id,
+                            chunkSeq = seq,
+                            last = false,
+                            payload = chunk,
+                        )
+                        ws.send(ByteString.of(*frame))
+                        seq++
+                        totalSent += n
+                        _fileEvents.tryEmit(
+                            FileTransferEvent.Progress(id, totalSent, size)
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "uploadFile $id reader error", e)
+                ws.send(ProtoJson.encodeToString(
+                    ClientMsg.serializer(),
+                    FileTransferAbort(id = id, reason = e.message ?: "io"),
+                ))
+                _fileEvents.tryEmit(FileTransferEvent.Failed(id, e.message ?: "io"))
+            }
+        }, "RC/Upload-$id").start()
+        return id
+    }
+
+    private val nextTransferId = java.util.concurrent.atomic.AtomicInteger(1)
+
     private inner class Listener : WebSocketListener() {
 
         override fun onOpen(ws: WebSocket, response: Response) {
@@ -363,6 +482,18 @@ class ConnectionClient(
                 is ClipboardText -> {
                     Log.i(TAG, "clipboard from PC: len=${msg.text.length}")
                     _clipboardFromPc.tryEmit(msg.text)
+                }
+                is FileTransferAccepted -> {
+                    Log.i(TAG, "file ${msg.id} accepted → ${msg.destPath}")
+                    _fileEvents.tryEmit(FileTransferEvent.Accepted(msg.id, msg.destPath))
+                }
+                is FileTransferComplete -> {
+                    Log.i(TAG, "file ${msg.id} complete → ${msg.destPath}")
+                    _fileEvents.tryEmit(FileTransferEvent.Complete(msg.id, msg.destPath))
+                }
+                is FileTransferFailed -> {
+                    Log.w(TAG, "file ${msg.id} failed: ${msg.reason}")
+                    _fileEvents.tryEmit(FileTransferEvent.Failed(msg.id, msg.reason))
                 }
             }
         }

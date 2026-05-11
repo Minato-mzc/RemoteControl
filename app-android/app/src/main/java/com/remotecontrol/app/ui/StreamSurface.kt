@@ -47,6 +47,7 @@ data class InputCallbacks(
     val onClipboardPush: (String) -> Unit = {},
     val onClipboardPull: () -> Unit = {},
     val onMacro: (Macro) -> Unit = {},
+    val onUploadFile: (android.net.Uri) -> Unit = {},
 )
 
 @Composable

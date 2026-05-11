@@ -137,6 +137,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun sendClipboardGet() = client.sendClipboardGet()
     val clipboardFromPc = client.clipboardFromPc
 
+    // M6: file upload (phone → PC).
+    val fileEvents = client.fileEvents
+    /** Trigger an upload. Caller supplies a name + size + a closure that
+     *  opens a fresh InputStream over the file (typically
+     *  `contentResolver.openInputStream(uri)`). */
+    fun uploadFile(name: String, size: Long, open: () -> java.io.InputStream): Int =
+        client.uploadFile(name, size, open)
+
     /** Run a macro by sequentially shipping its key_event steps. */
     fun runMacro(macro: Macro) {
         viewModelScope.launch {

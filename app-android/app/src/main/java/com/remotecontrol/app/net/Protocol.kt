@@ -110,6 +110,23 @@ class ClipboardGet : ClientMsg {
     override fun hashCode(): Int = 0
 }
 
+// ---- M6 file transfer (phone → PC) ----
+
+@Serializable
+@SerialName("file_transfer_begin")
+data class FileTransferBegin(
+    val id: Int,
+    val name: String,
+    val size: Long,
+) : ClientMsg
+
+@Serializable
+@SerialName("file_transfer_abort")
+data class FileTransferAbort(
+    val id: Int,
+    val reason: String = "",
+) : ClientMsg
+
 /** Win32 VK_* constants we expose in the keyboard overlay. */
 object VKey {
     const val ESCAPE = 0x1B
@@ -248,6 +265,29 @@ data class StreamStopped(
 @SerialName("clipboard_text")
 data class ClipboardText(val text: String) : ServerMsg
 
+// ---- M6 server replies ----
+
+@Serializable
+@SerialName("file_transfer_accepted")
+data class FileTransferAccepted(
+    val id: Int,
+    @SerialName("dest_path") val destPath: String,
+) : ServerMsg
+
+@Serializable
+@SerialName("file_transfer_complete")
+data class FileTransferComplete(
+    val id: Int,
+    @SerialName("dest_path") val destPath: String,
+) : ServerMsg
+
+@Serializable
+@SerialName("file_transfer_failed")
+data class FileTransferFailed(
+    val id: Int,
+    val reason: String,
+) : ServerMsg
+
 @Serializable
 data class ServerInfo(
     val name: String,
@@ -267,11 +307,55 @@ data class ServerInfo(
 object FrameType {
     const val VIDEO = 0x01
     const val AUDIO = 0x02 // reserved for M5
+    /** M6 file-transfer chunk. Reuses the 12-byte header layout; the
+     *  8 PTS bytes are repurposed as
+     *  `transfer_id (LE u32) || chunk_seq (LE u32)`. */
+    const val FILE = 0x03
 }
 
 object FrameFlags {
     const val KEYFRAME = 0x01
     const val CONFIG = 0x02
+    /** M6 file-transfer: marks the FINAL chunk in a transfer. */
+    const val LAST_CHUNK = 0x01
+}
+
+/**
+ * Build a single file-chunk WS Binary frame. Header is 12 bytes; layout
+ * mirrors the spec:
+ *   byte 0     : frame_type = 0x03
+ *   byte 1     : flags     (bit0 = LAST_CHUNK)
+ *   bytes 2-3  : reserved (must be 0)
+ *   bytes 4-7  : transfer_id (LE u32)
+ *   bytes 8-11 : chunk_seq   (LE u32)
+ *   bytes 12+  : payload
+ *
+ * The split of the 8 PTS bytes into two LE u32 fields keeps the header
+ * size the same as video / audio frames so transports that already know
+ * how to relay a 12-byte-prefixed binary frame don't need any changes.
+ */
+fun buildFileChunkFrame(
+    transferId: Int,
+    chunkSeq: Int,
+    last: Boolean,
+    payload: ByteArray,
+): ByteArray {
+    val out = ByteArray(FRAME_HEADER_LEN + payload.size)
+    out[0] = FrameType.FILE.toByte()
+    out[1] = (if (last) FrameFlags.LAST_CHUNK else 0).toByte()
+    // bytes 2,3: reserved (0)
+    // transfer_id LE u32 at bytes 4-7
+    out[4] = (transferId and 0xFF).toByte()
+    out[5] = ((transferId ushr 8) and 0xFF).toByte()
+    out[6] = ((transferId ushr 16) and 0xFF).toByte()
+    out[7] = ((transferId ushr 24) and 0xFF).toByte()
+    // chunk_seq LE u32 at bytes 8-11
+    out[8] = (chunkSeq and 0xFF).toByte()
+    out[9] = ((chunkSeq ushr 8) and 0xFF).toByte()
+    out[10] = ((chunkSeq ushr 16) and 0xFF).toByte()
+    out[11] = ((chunkSeq ushr 24) and 0xFF).toByte()
+    System.arraycopy(payload, 0, out, FRAME_HEADER_LEN, payload.size)
+    return out
 }
 
 const val FRAME_HEADER_LEN = 12

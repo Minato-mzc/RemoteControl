@@ -77,6 +77,7 @@ fun KeyboardOverlay(
     onClipboardPush: (String) -> Unit,
     onClipboardPull: () -> Unit,
     onMacro: (Macro) -> Unit,
+    onUploadFile: (android.net.Uri) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var expanded by remember { mutableStateOf(false) }
@@ -110,6 +111,7 @@ fun KeyboardOverlay(
                 onClipboardPush = onClipboardPush,
                 onClipboardPull = onClipboardPull,
                 onMacro = onMacro,
+                onUploadFile = onUploadFile,
                 onClose = { expanded = false },
                 modifier = Modifier.align(Alignment.BottomCenter),
             )
@@ -125,6 +127,7 @@ private fun ExpandedPanel(
     onClipboardPush: (String) -> Unit,
     onClipboardPull: () -> Unit,
     onMacro: (Macro) -> Unit,
+    onUploadFile: (android.net.Uri) -> Unit,
     onClose: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -197,6 +200,15 @@ private fun ExpandedPanel(
                 }
             }
             KKey("复制到手机") { onClipboardPull() }
+            // M6 phone→PC file upload. SAF (GetContent) opens the system
+            // picker — same UI Android uses everywhere, no extra
+            // permission to request.
+            val pickFile = androidx.activity.compose.rememberLauncherForActivityResult(
+                androidx.activity.result.contract.ActivityResultContracts.GetContent(),
+            ) { uri ->
+                if (uri != null) onUploadFile(uri)
+            }
+            KKey("上传文件") { pickFile.launch("*/*") }
         }
 
         // Macro row: common Windows shortcuts in one tap.

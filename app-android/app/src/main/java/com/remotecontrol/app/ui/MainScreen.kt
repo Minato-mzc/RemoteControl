@@ -195,6 +195,7 @@ private fun ConnectedScreen(
                 onClipboardPush = input.onClipboardPush,
                 onClipboardPull = input.onClipboardPull,
                 onMacro = input.onMacro,
+                onUploadFile = input.onUploadFile,
                 modifier = Modifier.fillMaxSize(),
             )
 

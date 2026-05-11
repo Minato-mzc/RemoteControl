@@ -95,6 +95,29 @@ pub enum ClientMsg {
     /// Request the PC clipboard (server replies with `clipboard_text`).
     #[serde(rename = "clipboard_get")]
     ClipboardGet,
+
+    // ---- M6: file transfer (phone → PC v1) ----
+
+    /// Announce a new file-transfer session. Server allocates an output
+    /// path under the user's Downloads/RemoteControl folder, opens the
+    /// file, and replies with `FileTransferAccepted`. Subsequent Binary
+    /// frames with `frame_type=FILE` and the same `id` carry chunked
+    /// content; the final chunk has the `LAST` flag set.
+    #[serde(rename = "file_transfer_begin")]
+    FileTransferBegin {
+        id: u32,
+        name: String,
+        size: u64,
+    },
+
+    /// Voluntary cancel before reaching the LAST chunk. Server closes
+    /// and unlinks the partial output.
+    #[serde(rename = "file_transfer_abort")]
+    FileTransferAbort {
+        id: u32,
+        #[serde(default)]
+        reason: String,
+    },
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +196,24 @@ pub enum ServerMsg {
     /// Reply to a `clipboard_get` with the current PC clipboard text.
     #[serde(rename = "clipboard_text")]
     ClipboardText { text: String },
+
+    // ---- M6: file transfer ----
+
+    /// Server accepted the transfer and opened the destination file.
+    /// Phone can start streaming chunks.
+    #[serde(rename = "file_transfer_accepted")]
+    FileTransferAccepted { id: u32, dest_path: String },
+
+    /// Final ack — all chunks received, file closed and renamed into
+    /// place. `dest_path` is the on-disk path (useful for the phone UI
+    /// to show "已保存到 ...").
+    #[serde(rename = "file_transfer_complete")]
+    FileTransferComplete { id: u32, dest_path: String },
+
+    /// Anything went wrong — bad name, no space, IO error, premature
+    /// disconnect, abort, etc. Phone shows the reason to the user.
+    #[serde(rename = "file_transfer_failed")]
+    FileTransferFailed { id: u32, reason: String },
 }
 
 #[derive(Debug, Serialize)]
@@ -250,6 +291,10 @@ pub mod frame_type {
     pub const VIDEO: u8 = 0x01;
     #[allow(dead_code)]
     pub const AUDIO: u8 = 0x02; // reserved for M5
+    /// M6 file-transfer chunk. Reuses the 12-byte header layout; the
+    /// 8 bytes that hold `pts_us` for video are repurposed as
+    /// `transfer_id (u32 LE) || chunk_seq (u32 LE)`.
+    pub const FILE: u8 = 0x03;
 }
 
 /// `flags` byte bits
@@ -258,6 +303,10 @@ pub mod frame_flags {
     pub const KEYFRAME: u8 = 1 << 0;
     /// Payload is prefixed with parameter sets (SPS/PPS), inline. Always set on H.264 IDR frames.
     pub const CONFIG: u8 = 1 << 1;
+    /// M6 file-transfer: marks the FINAL chunk in a transfer. After
+    /// receiving a frame with this bit set, the server flushes + closes
+    /// the destination file and emits `FileTransferComplete`.
+    pub const LAST_CHUNK: u8 = 1 << 0;
 }
 
 /// Build a video frame: 12-byte header + Annex-B payload, ready for `WebSocket::send(Binary)`.
@@ -287,6 +336,30 @@ pub fn build_audio_frame(payload: &[u8], pts_us: u64) -> Vec<u8> {
     out.extend_from_slice(&pts_us.to_le_bytes());
     out.extend_from_slice(payload);
     out
+}
+
+/// Parse a binary frame's 12-byte header. Returns `(frame_type, flags,
+/// pts_or_id_seq_bytes, payload_offset)`. Caller dispatches on
+/// `frame_type` and re-interprets the 8-byte field accordingly.
+pub fn peek_frame_header(buf: &[u8]) -> Option<(u8, u8)> {
+    if buf.len() < FRAME_HEADER_LEN {
+        return None;
+    }
+    Some((buf[0], buf[1]))
+}
+
+/// Decode a FILE chunk header (the 8 PTS bytes are split into
+/// `transfer_id (u32 LE) || chunk_seq (u32 LE)`). Returns
+/// `(transfer_id, chunk_seq, is_last, payload_slice)`.
+pub fn parse_file_chunk(buf: &[u8]) -> Option<(u32, u32, bool, &[u8])> {
+    if buf.len() < FRAME_HEADER_LEN {
+        return None;
+    }
+    let flags = buf[1];
+    let id = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let seq = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    let is_last = (flags & frame_flags::LAST_CHUNK) != 0;
+    Some((id, seq, is_last, &buf[FRAME_HEADER_LEN..]))
 }
 
 #[cfg(test)]

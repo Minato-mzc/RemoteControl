@@ -60,6 +60,12 @@ pub async fn run_connection(
 
     let mut authenticated = false;
     let mut active_stream: Option<StreamHandle> = None;
+    // M6 file transfer state. Keyed by `transfer_id` so multiple in-flight
+    // uploads are independent (in practice the phone sends one at a time
+    // but the protocol doesn't forbid more). Entries removed on
+    // last-chunk, abort, or peer disconnect.
+    let mut file_transfers: std::collections::HashMap<u32, FileTransferState> =
+        std::collections::HashMap::new();
 
     loop {
         // Optional packet-receive future. Built fresh each iteration so the
@@ -82,18 +88,86 @@ pub async fn run_connection(
                                 send_error(&outbox, ErrorCode::Malformed, "cannot parse message");
                                 break;
                             }
-                            Ok(parsed) => {
-                                let cont = handle_client_msg(
-                                    parsed,
+                            Ok(parsed) => match parsed {
+                                // M6 file-transfer messages need async
+                                // file IO so we handle them inline here
+                                // rather than threading `&mut file_transfers`
+                                // and async-ifying the whole
+                                // `handle_client_msg` switch. Anything
+                                // else falls through to the existing
+                                // synchronous dispatch.
+                                ClientMsg::FileTransferBegin { id, name, size } => {
+                                    if !authenticated {
+                                        send(
+                                            &outbox,
+                                            ServerMsg::FileTransferFailed {
+                                                id,
+                                                reason: "not authenticated".into(),
+                                            },
+                                        );
+                                        continue;
+                                    }
+                                    handle_file_begin(
+                                        id,
+                                        &name,
+                                        size,
+                                        &peer_label,
+                                        &mut file_transfers,
+                                        &outbox,
+                                    )
+                                    .await;
+                                }
+                                ClientMsg::FileTransferAbort { id, reason } => {
+                                    handle_file_abort(
+                                        id,
+                                        &reason,
+                                        &peer_label,
+                                        &mut file_transfers,
+                                    )
+                                    .await;
+                                }
+                                other => {
+                                    let cont = handle_client_msg(
+                                        other,
+                                        &peer_label,
+                                        &pairing,
+                                        &trusted,
+                                        &cfg,
+                                        &mut authenticated,
+                                        &mut active_stream,
+                                        &outbox,
+                                    );
+                                    if !cont { break; }
+                                }
+                            },
+                        }
+                    }
+                    Message::Binary(bytes) => {
+                        // M6: phone→PC file chunks arrive as Binary
+                        // frames with `frame_type=FILE`. Other frame
+                        // types from the phone side don't exist yet
+                        // (video/audio are server→phone only), so
+                        // anything that isn't FILE is dropped with a
+                        // log line. We also gate this on
+                        // `authenticated` so an unauthed peer can't
+                        // dump random bytes onto the user's disk.
+                        if !authenticated {
+                            warn!("{peer_label}: binary before auth — dropping");
+                            continue;
+                        }
+                        if let Some((t, _flags)) = crate::protocol::peek_frame_header(&bytes) {
+                            if t == crate::protocol::frame_type::FILE {
+                                handle_file_chunk(
+                                    &bytes,
                                     &peer_label,
-                                    &pairing,
-                                    &trusted,
-                                    &cfg,
-                                    &mut authenticated,
-                                    &mut active_stream,
+                                    &mut file_transfers,
                                     &outbox,
+                                )
+                                .await;
+                            } else {
+                                warn!(
+                                    "{peer_label}: unexpected client binary frame type {t}"
                                 );
-                                if !cont { break; }
                             }
                         }
                     }
@@ -130,6 +204,17 @@ pub async fn run_connection(
 
     if let Some(handle) = active_stream.take() {
         handle.stop();
+    }
+    // M6: any in-flight uploads get their partial files unlinked so the
+    // user doesn't end up with a half-written file sitting in Downloads.
+    for (id, state) in file_transfers.drain() {
+        drop(state.file);
+        if let Err(e) = tokio::fs::remove_file(&state.dest_path).await {
+            warn!(
+                "{peer_label}: cleanup of partial upload {id} ({}) failed: {e}",
+                state.dest_path.display()
+            );
+        }
     }
     info!("peer disconnected: {peer_label} (authenticated={authenticated})");
     Ok(())
@@ -461,6 +546,17 @@ fn handle_client_msg(
         | ClientMsg::KeyEvent { .. }
         | ClientMsg::ClipboardSet { .. }
         | ClientMsg::ClipboardGet => {}
+
+        // M6 file transfer messages are handled async upstream in
+        // `run_connection` before this synchronous dispatch is reached.
+        // Listing them here keeps the enum exhaustive.
+        ClientMsg::FileTransferBegin { .. } | ClientMsg::FileTransferAbort { .. } => {
+            // Unreachable in normal flow; if the dispatch ordering ever
+            // changes upstream, fail loudly rather than silently dropping.
+            warn!(
+                "{peer_label}: file-transfer msg reached sync dispatch (bug)"
+            );
+        }
     }
 
     true
@@ -474,6 +570,295 @@ pub fn send(outbox: &OutboundTx, msg: ServerMsg) {
     if let Ok(text) = serde_json::to_string(&msg) {
         let _ = outbox.send(Message::Text(text.into()));
     }
+}
+
+// ----------------------------------------------------------------------
+// M6: phone → PC file transfer
+// ----------------------------------------------------------------------
+
+/// Per-transfer state kept in `run_connection`'s `HashMap` for the life
+/// of one upload. Dropped on completion, abort, or peer disconnect —
+/// the latter case removes the partial file from disk too.
+pub struct FileTransferState {
+    pub dest_path: std::path::PathBuf,
+    pub file: tokio::fs::File,
+    pub expected_size: u64,
+    pub bytes_written: u64,
+    /// We send chunks strictly in order, so the next chunk we accept
+    /// must have `chunk_seq == next_expected_seq`. Out-of-order chunks
+    /// would mean WS reordering (shouldn't happen on a single TCP
+    /// stream) or buggy client; either way we fail the transfer rather
+    /// than try to recover.
+    pub next_expected_seq: u32,
+}
+
+async fn handle_file_begin(
+    id: u32,
+    name: &str,
+    size: u64,
+    peer_label: &str,
+    transfers: &mut std::collections::HashMap<u32, FileTransferState>,
+    outbox: &OutboundTx,
+) {
+    if transfers.contains_key(&id) {
+        send(
+            outbox,
+            ServerMsg::FileTransferFailed {
+                id,
+                reason: "duplicate transfer id".into(),
+            },
+        );
+        return;
+    }
+    // Soft cap: reject pathological sizes (>16 GiB) early. We accept any
+    // smaller size — Windows NTFS handles up to 16 EiB, but 16 GiB is
+    // already absurd for a remote-control accessory and serves as a
+    // sanity check against bad clients.
+    if size > 16 * 1024 * 1024 * 1024 {
+        send(
+            outbox,
+            ServerMsg::FileTransferFailed {
+                id,
+                reason: "file too large (>16 GiB)".into(),
+            },
+        );
+        return;
+    }
+    let dest_dir = match downloads_dir().await {
+        Ok(p) => p,
+        Err(e) => {
+            send(
+                outbox,
+                ServerMsg::FileTransferFailed {
+                    id,
+                    reason: format!("downloads dir: {e:#}"),
+                },
+            );
+            return;
+        }
+    };
+    let safe_name = sanitize_filename(name);
+    let dest_path = match unique_dest_path(&dest_dir, &safe_name).await {
+        Ok(p) => p,
+        Err(e) => {
+            send(
+                outbox,
+                ServerMsg::FileTransferFailed {
+                    id,
+                    reason: format!("dest path: {e:#}"),
+                },
+            );
+            return;
+        }
+    };
+    let file = match tokio::fs::File::create(&dest_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            send(
+                outbox,
+                ServerMsg::FileTransferFailed {
+                    id,
+                    reason: format!("open {}: {e}", dest_path.display()),
+                },
+            );
+            return;
+        }
+    };
+    info!(
+        "file transfer {id} from {peer_label} → {} ({} bytes expected)",
+        dest_path.display(),
+        size
+    );
+    transfers.insert(
+        id,
+        FileTransferState {
+            dest_path: dest_path.clone(),
+            file,
+            expected_size: size,
+            bytes_written: 0,
+            next_expected_seq: 0,
+        },
+    );
+    send(
+        outbox,
+        ServerMsg::FileTransferAccepted {
+            id,
+            dest_path: dest_path.to_string_lossy().into_owned(),
+        },
+    );
+}
+
+async fn handle_file_abort(
+    id: u32,
+    reason: &str,
+    peer_label: &str,
+    transfers: &mut std::collections::HashMap<u32, FileTransferState>,
+) {
+    if let Some(state) = transfers.remove(&id) {
+        info!(
+            "file transfer {id} from {peer_label} aborted: {reason} (partial \
+             {} of {} bytes)",
+            state.bytes_written, state.expected_size
+        );
+        drop(state.file);
+        if let Err(e) = tokio::fs::remove_file(&state.dest_path).await {
+            warn!(
+                "remove partial {}: {e}",
+                state.dest_path.display()
+            );
+        }
+    }
+}
+
+async fn handle_file_chunk(
+    bytes: &[u8],
+    peer_label: &str,
+    transfers: &mut std::collections::HashMap<u32, FileTransferState>,
+    outbox: &OutboundTx,
+) {
+    let Some((id, seq, is_last, payload)) = crate::protocol::parse_file_chunk(bytes) else {
+        warn!("{peer_label}: malformed file chunk ({} bytes)", bytes.len());
+        return;
+    };
+    // Phase 1: pull the state out so we can mutate without keeping the
+    // map borrowed; we put it back (or not, if this is the last chunk)
+    // at the end.
+    let mut state = match transfers.remove(&id) {
+        Some(s) => s,
+        None => {
+            warn!("{peer_label}: chunk for unknown transfer id {id}");
+            return;
+        }
+    };
+    if seq != state.next_expected_seq {
+        warn!(
+            "{peer_label}: file {id}: out-of-order chunk (got {seq}, expected {})",
+            state.next_expected_seq
+        );
+        let dest = state.dest_path.clone();
+        drop(state.file);
+        let _ = tokio::fs::remove_file(&dest).await;
+        send(
+            outbox,
+            ServerMsg::FileTransferFailed {
+                id,
+                reason: format!("chunk out of order: got {seq}"),
+            },
+        );
+        return;
+    }
+    use tokio::io::AsyncWriteExt;
+    if let Err(e) = state.file.write_all(payload).await {
+        warn!("{peer_label}: file {id} write_all: {e}");
+        let dest = state.dest_path.clone();
+        drop(state.file);
+        let _ = tokio::fs::remove_file(&dest).await;
+        send(
+            outbox,
+            ServerMsg::FileTransferFailed {
+                id,
+                reason: format!("write: {e}"),
+            },
+        );
+        return;
+    }
+    state.bytes_written += payload.len() as u64;
+    state.next_expected_seq = state.next_expected_seq.wrapping_add(1);
+
+    if is_last {
+        if let Err(e) = state.file.flush().await {
+            warn!("{peer_label}: file {id} flush: {e}");
+        }
+        if state.expected_size != 0 && state.bytes_written != state.expected_size {
+            warn!(
+                "file transfer {id} size mismatch: wrote {} of {} bytes",
+                state.bytes_written, state.expected_size
+            );
+        }
+        let dest_display = state.dest_path.to_string_lossy().into_owned();
+        info!(
+            "file transfer {id} from {peer_label} done: {} bytes → {}",
+            state.bytes_written, dest_display
+        );
+        drop(state.file);
+        send(
+            outbox,
+            ServerMsg::FileTransferComplete {
+                id,
+                dest_path: dest_display,
+            },
+        );
+        // state dropped, not re-inserted
+    } else {
+        transfers.insert(id, state);
+    }
+}
+
+/// `%USERPROFILE%\Downloads\RemoteControl` on Windows, `$HOME/Downloads
+/// /RemoteControl` elsewhere. Created if missing.
+async fn downloads_dir() -> Result<std::path::PathBuf> {
+    let base = if cfg!(windows) {
+        std::env::var_os("USERPROFILE")
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("USERPROFILE not set"))?
+    } else {
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("HOME not set"))?
+    };
+    let dir = base.join("Downloads").join("RemoteControl");
+    tokio::fs::create_dir_all(&dir).await?;
+    Ok(dir)
+}
+
+/// Strip dangerous characters from a phone-provided file name. Returns
+/// a safe basename (no path separators, no leading/trailing whitespace,
+/// max 200 chars). An empty or all-bad input falls back to a generic
+/// `received.bin` so the upload still has somewhere to land.
+fn sanitize_filename(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| {
+            !(*c == '/' || *c == '\\' || *c == '\0' || *c == ':' || *c == '*'
+                || *c == '?' || *c == '"' || *c == '<' || *c == '>' || *c == '|')
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return "received.bin".to_string();
+    }
+    if trimmed.chars().count() > 200 {
+        // Truncate but keep extension if present.
+        let (stem, ext) = match trimmed.rsplit_once('.') {
+            Some((s, e)) if e.len() < 32 => (s, format!(".{e}")),
+            _ => (trimmed, String::new()),
+        };
+        let take = 200 - ext.chars().count();
+        let stem_short: String = stem.chars().take(take).collect();
+        return format!("{stem_short}{ext}");
+    }
+    trimmed.to_string()
+}
+
+/// Resolve a non-colliding destination path. If `dir/name` already
+/// exists, try `dir/name (1)`, `dir/name (2)`, etc. up to 999. The
+/// stem-vs-extension split preserves `.txt` etc.
+async fn unique_dest_path(dir: &std::path::Path, name: &str) -> Result<std::path::PathBuf> {
+    let initial = dir.join(name);
+    if tokio::fs::metadata(&initial).await.is_err() {
+        return Ok(initial);
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+        _ => (name.to_string(), String::new()),
+    };
+    for n in 1..=999 {
+        let candidate = dir.join(format!("{stem} ({n}){ext}"));
+        if tokio::fs::metadata(&candidate).await.is_err() {
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!("no unique path under {} for {name}", dir.display())
 }
 
 pub fn send_error(outbox: &OutboundTx, code: ErrorCode, m: &str) {
