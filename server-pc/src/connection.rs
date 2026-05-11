@@ -67,6 +67,18 @@ pub async fn run_connection(
     let mut file_transfers: std::collections::HashMap<u32, FileTransferState> =
         std::collections::HashMap::new();
 
+    // Watchdog: if no inbound message arrives in this window, treat the
+    // connection as zombied and tear it down. Healthy phones send a
+    // WS Ping every 20 s plus mouse/keyboard activity during use, so
+    // 45 s of silence is well past the "alive but idle" baseline and a
+    // reliable signal that ClientClose got lost on the way back through
+    // the relay (observed in practice: phone app force-quit during
+    // upload leaves the WS half-open from the PC's perspective, the old
+    // run_connection task keeps the stream worker alive, DXGI
+    // duplication stays held, and every subsequent reconnect can't
+    // start_stream).
+    let idle_timeout = std::time::Duration::from_secs(45);
+
     loop {
         // Optional packet-receive future. Built fresh each iteration so the
         // borrow on `active_stream` doesn't outlive the select.
@@ -78,6 +90,15 @@ pub async fn run_connection(
         };
 
         tokio::select! {
+            _ = tokio::time::sleep(idle_timeout) => {
+                warn!(
+                    "{peer_label}: no inbox activity for {}s — assuming zombie connection, \
+                     tearing down (was authenticated={authenticated}, had_stream={})",
+                    idle_timeout.as_secs(),
+                    active_stream.is_some(),
+                );
+                break;
+            }
             msg = inbox.recv() => {
                 let Some(msg) = msg else { break }; // transport gone
                 match msg {

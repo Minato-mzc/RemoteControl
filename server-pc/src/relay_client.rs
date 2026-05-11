@@ -452,11 +452,46 @@ impl RelayClient {
 
         // Writer: us → relay. Binary tunnel frames go straight onto the
         // wire — one Message::Binary per TunnelFrame, no JSON envelope.
+        //
+        // Also drives a 30 s application-level Ping. The PC↔relay WS
+        // can sit idle for many minutes between phone sessions; some
+        // middleboxes on the path (carrier-grade NAT, VPS security
+        // group with idle-flow eviction) silently drop TCP after a few
+        // minutes of no traffic, and neither tokio-tungstenite (this
+        // side) nor axum (relay side) auto-pings. A Ping every 30 s
+        // keeps the flow warm; if the Ping itself can't be written —
+        // because TCP is genuinely dead — we break and propagate the
+        // error so the outer reconnect loop in `lib.rs` reopens the WS.
+        let mut keepalive = tokio::time::interval(
+            std::time::Duration::from_secs(30),
+        );
+        // First tick fires immediately by default; skip it so we don't
+        // ping before the relay has even acknowledged the upgrade.
+        keepalive.tick().await;
         let writer = tokio::spawn(async move {
-            while let Some(frame) = host_out_rx.recv().await {
-                let bytes = frame.encode();
-                if ws_sink.send(Message::Binary(bytes.into())).await.is_err() {
-                    break;
+            loop {
+                tokio::select! {
+                    frame = host_out_rx.recv() => {
+                        let Some(frame) = frame else { break };
+                        let bytes = frame.encode();
+                        if ws_sink
+                            .send(Message::Binary(bytes.into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    _ = keepalive.tick() => {
+                        if ws_sink
+                            .send(Message::Ping(Vec::new().into()))
+                            .await
+                            .is_err()
+                        {
+                            warn!("relay keepalive ping failed — tunnel is dead");
+                            break;
+                        }
+                    }
                 }
             }
             let _ = ws_sink.close().await;

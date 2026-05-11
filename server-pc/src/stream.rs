@@ -112,33 +112,44 @@ impl Drop for StreamHandle {
 }
 
 pub fn start_stream(req: StreamRequestParams) -> Result<StreamHandle> {
-    // Retry DXGI duplication setup a couple times. When a previous
-    // stream's video loop has just exited (peer disconnect → handle drop
-    // → loop notices stop flag → returns), the underlying COM
-    // `IDXGIOutputDuplication` object can take ~100-300 ms to fully
-    // release inside Windows; if the user mashes "重试" right after a
-    // disconnect, the new `DxgiCapture::new()` lands inside that window
-    // and surfaces as `DuplicateOutput` (Windows reports
+    // Retry DXGI duplication setup. When a previous stream's video loop
+    // has just exited (peer disconnect → handle drop → loop notices stop
+    // flag → returns), the underlying COM `IDXGIOutputDuplication` object
+    // can take a noticeable amount of time to fully release inside
+    // Windows; the new `DxgiCapture::new()` lands inside that window and
+    // surfaces as `DuplicateOutput` (Windows reports
     // `DXGI_ERROR_NOT_CURRENTLY_AVAILABLE` because only one duplication
-    // per output is allowed). A short retry loop hides this from the
-    // user without needing global serialization or a sleep on the disconnect
-    // path.
+    // per output is allowed).
+    //
+    // Two factors set the loop bound:
+    //   * Normal back-to-back reconnect needs ~100-300 ms — the original
+    //     value of 5×200ms was tuned for that.
+    //   * After a session that streamed for a while and was running file
+    //     I/O alongside, Windows takes much longer to release. Observed
+    //     in production: a clean stop after ~50 s of streaming + an
+    //     uploading file transfer left the COM object held for several
+    //     seconds. With the old 1 s budget the next reconnect failed.
+    //   * 15 × 300ms = 4.5 s gives both cases enough room without
+    //     keeping the user waiting forever on a truly stuck adapter
+    //     (driver crash, monitor unplugged) — past that, surfacing the
+    //     error is more useful than a longer hang.
     let cap = {
         let mut last_err: Option<anyhow::Error> = None;
         let mut out: Option<DxgiCapture> = None;
-        for attempt in 0..5 {
+        const ATTEMPTS: usize = 15;
+        for attempt in 0..ATTEMPTS {
             match DxgiCapture::new() {
                 Ok(c) => {
                     out = Some(c);
                     break;
                 }
                 Err(e) => {
-                    if attempt < 4 {
+                    if attempt < ATTEMPTS - 1 {
                         warn!(
-                            "DxgiCapture::new failed on attempt {}: {e:#} — retrying in 200ms",
+                            "DxgiCapture::new failed on attempt {}: {e:#} — retrying in 300ms",
                             attempt + 1
                         );
-                        std::thread::sleep(Duration::from_millis(200));
+                        std::thread::sleep(Duration::from_millis(300));
                     }
                     last_err = Some(e);
                 }

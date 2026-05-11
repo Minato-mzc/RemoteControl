@@ -35,6 +35,28 @@ private const val TAG = "RC/WS"
  *  memory while a slow link drains. */
 private const val CHUNK_BYTES = 256 * 1024
 
+/** Back-pressure threshold: when okhttp's outbound buffer exceeds this
+ *  many bytes the upload loop blocks until the buffer drains below it.
+ *
+ *  Pairs with [PING_INTERVAL_SECONDS] to keep ping/pong alive during
+ *  uploads. OkHttp's WS sender is FIFO and does not prioritize Ping
+ *  frames — every Ping enqueued behind a backlog waits the full drain
+ *  time before going on the wire. With the threshold at 256 KiB the
+ *  queue never carries more than ~512 KiB even transiently, so on any
+ *  link faster than ~8 KB/s a Ping drains in <60 s and the keepalive
+ *  timer's pong arrives in time. Below 8 KB/s the radio is effectively
+ *  unusable for sustained transfers anyway — letting the WS die in
+ *  that case is the right signal to the user. */
+private const val UPLOAD_BACKPRESSURE_BYTES = 256L * 1024
+
+/** Hard ceiling on how long we'll wait for the okhttp buffer to drain
+ *  below [UPLOAD_BACKPRESSURE_BYTES] before giving up. At a 256 KiB
+ *  threshold even a 1 Mbps link drains the queue in ~2 s, so a 30 s
+ *  stall means the underlying TCP is wedged (radio off, mid-handover,
+ *  remote not ACKing) — letting the next `send()` fail surfaces the
+ *  fault to the user faster than silently waiting forever. */
+private const val UPLOAD_BACKPRESSURE_TIMEOUT_MS = 30_000L
+
 /** Lifecycle events for an in-flight upload. Subscribed by the UI to
  *  render progress and Toasts. */
 sealed interface FileTransferEvent {
@@ -362,9 +384,15 @@ class ConnectionClient(
             FileTransferBegin(id = id, name = name, size = size),
         ))
         // Stream in a background thread — chunking + WS send must not
-        // block whichever main/IO scope called us. okhttp WebSocket.send
-        // is already non-blocking (queues internally) but reading from
-        // the file is.
+        // block whichever main/IO scope called us. We throttle against
+        // okhttp's internal send buffer (`queueSize()`) — okhttp closes
+        // the WebSocket with code 1001 the moment its buffer exceeds
+        // 16 MiB, so naïvely pushing a 1+ GiB file's worth of chunks
+        // straight into `send()` blew the connection up at ~16 MiB and
+        // dropped the rest on the floor while the UI progress bar
+        // happily reported 100 %. Cap the in-flight buffer at ~4 MiB so
+        // the connection has plenty of headroom and progress reflects
+        // bytes that have actually been pushed onto the wire.
         Thread({
             try {
                 open().use { input ->
@@ -382,20 +410,36 @@ class ConnectionClient(
                                 last = true,
                                 payload = ByteArray(0),
                             )
-                            ws.send(ByteString.of(*frame))
+                            waitForBufferRoom(ws)
+                            if (!ws.send(ByteString.of(*frame))) {
+                                throw java.io.IOException(
+                                    "WebSocket.send rejected last chunk (buffer/closed)"
+                                )
+                            }
                             break
                         }
                         val chunk = if (n == buf.size) buf else buf.copyOf(n)
-                        // If we hit EOF exactly on a chunk boundary the
-                        // next read returned -1 above; otherwise we flag
-                        // LAST when this is the tail.
                         val frame = buildFileChunkFrame(
                             transferId = id,
                             chunkSeq = seq,
                             last = false,
                             payload = chunk,
                         )
-                        ws.send(ByteString.of(*frame))
+                        // Back-pressure loop: spin briefly until okhttp's
+                        // outbound buffer is small enough to accept us
+                        // without risk of tripping the 16 MiB limit.
+                        waitForBufferRoom(ws)
+                        if (!ws.send(ByteString.of(*frame))) {
+                            // `send` only returns false when the socket
+                            // is already closed or the buffer is over
+                            // 16 MiB. Either way, the rest of the
+                            // transfer can't land — bail and let the
+                            // server clean up the partial file via its
+                            // own peer-disconnect path.
+                            throw java.io.IOException(
+                                "WebSocket.send rejected (buffer/closed) at seq=$seq"
+                            )
+                        }
                         seq++
                         totalSent += n
                         _fileEvents.tryEmit(
@@ -416,6 +460,32 @@ class ConnectionClient(
     }
 
     private val nextTransferId = java.util.concurrent.atomic.AtomicInteger(1)
+
+    /** Block until okhttp's outbound buffer drops below
+     *  [UPLOAD_BACKPRESSURE_BYTES], polling every 20 ms. Caps total wait
+     *  so we don't get stuck forever on a fully dead connection — past
+     *  the cap we just return and let the caller's `send` fail
+     *  (returning false) so the upload aborts loudly instead of hanging.
+     */
+    private fun waitForBufferRoom(ws: okhttp3.WebSocket) {
+        val startMs = System.currentTimeMillis()
+        while (ws.queueSize() > UPLOAD_BACKPRESSURE_BYTES) {
+            if (System.currentTimeMillis() - startMs > UPLOAD_BACKPRESSURE_TIMEOUT_MS) {
+                Log.w(
+                    TAG,
+                    "waitForBufferRoom: still ${ws.queueSize()} bytes queued after " +
+                        "${UPLOAD_BACKPRESSURE_TIMEOUT_MS}ms — giving up",
+                )
+                return
+            }
+            try {
+                Thread.sleep(20)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return
+            }
+        }
+    }
 
     private inner class Listener : WebSocketListener() {
 
@@ -518,6 +588,23 @@ class ConnectionClient(
 
         override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
             Log.w(TAG, "ws failed", t)
+            // Stale-listener guard: if `webSocket` no longer points at
+            // this `ws`, the user has already started a fresh connection
+            // and this callback belongs to the *previous* WS finishing
+            // its close handshake. We must NOT touch any shared state
+            // (the `webSocket` ref or `_state`) — otherwise we'd clobber
+            // the new connection's ws ref to null and the next
+            // `requestStream()` would silently return because its
+            // `val ws = webSocket ?: return` guard would short-circuit.
+            // Symptom observed in production: after manually
+            // disconnecting mid-upload and immediately reconnecting,
+            // the phone sits on "正在请求屏幕串流" forever because the
+            // old upload's lingering Close handshake clobbers the new
+            // ws on completion.
+            if (webSocket !== ws) {
+                Log.i(TAG, "stale onFailure for old ws — ignored")
+                return
+            }
             // Combined-QR fallback: if the scanned QR carried both a LAN
             // primary and a relay backup, consume the backup exactly
             // once and retry the dial against it. Typical use: user is
@@ -544,6 +631,12 @@ class ConnectionClient(
 
         override fun onClosed(ws: WebSocket, code: Int, reason: String) {
             Log.i(TAG, "closed code=$code reason=$reason")
+            // Same stale-listener guard as in `onFailure` — see there
+            // for the full rationale.
+            if (webSocket !== ws) {
+                Log.i(TAG, "stale onClosed for old ws — ignored")
+                return
+            }
             webSocket = null
             if (_state.value is ConnectionState.Connected) {
                 _state.value = ConnectionState.Idle
@@ -642,8 +735,24 @@ class ConnectionClient(
     }
 
     companion object {
+        /** WebSocket keepalive interval. OkHttp uses this same value as
+         *  the pong-timeout: if the server doesn't pong within
+         *  pingInterval of the ping going out, the WS is torn down as
+         *  a dead-link signal.
+         *
+         *  20 s is a fine number for an idle WS, but it falls apart
+         *  during a file upload on a slow cellular link: OkHttp queues
+         *  pings behind data frames, and at e.g. 50 KB/s upstream a
+         *  256 KiB chunk takes 5 s just to leave the radio — multiple
+         *  consecutive slow chunks easily pad the queue past 20 s of
+         *  pending bytes, and the next ping starves. 60 s tolerates
+         *  brief tower handovers / congestion dips that are routine on
+         *  4G without sacrificing too much dead-link detection latency
+         *  (we'll still notice a truly dead radio inside a minute). */
+        private const val PING_INTERVAL_SECONDS = 60L
+
         private fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
-            .pingInterval(20.seconds.inWholeMilliseconds, java.util.concurrent.TimeUnit.MILLISECONDS)
+            .pingInterval(PING_INTERVAL_SECONDS, java.util.concurrent.TimeUnit.SECONDS)
             // Connect timeout 4s (default 10s) so a combined-QR scan
             // doesn't hang for a full 10 seconds when the LAN address
             // is unreachable. The phone-side relay fallback in

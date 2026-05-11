@@ -19,6 +19,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.Icons
@@ -53,6 +56,7 @@ fun MainScreen(
     audioFrames: SharedFlow<AudioFrame>,
     clipboardFromPc: SharedFlow<String>,
     framesReceived: Long,
+    uploads: List<UploadStatus>,
     input: InputCallbacks,
     trustedServers: List<TrustedServer>,
     onScanClick: () -> Unit,
@@ -72,7 +76,7 @@ fun MainScreen(
         }
     }
     when (state) {
-        is ConnectionState.Connected -> ConnectedScreen(state, frames, audioFrames, framesReceived, input, onDisconnect)
+        is ConnectionState.Connected -> ConnectedScreen(state, frames, audioFrames, framesReceived, uploads, input, onDisconnect)
         else -> CenteredColumn {
             Header()
             Spacer(Modifier.height(40.dp))
@@ -103,6 +107,7 @@ private fun ConnectedScreen(
     frames: SharedFlow<VideoFrame>,
     audioFrames: SharedFlow<AudioFrame>,
     framesReceived: Long,
+    uploads: List<UploadStatus>,
     input: InputCallbacks,
     onDisconnect: () -> Unit,
 ) {
@@ -202,6 +207,15 @@ private fun ConnectedScreen(
             // Audio playback (headless effect — no UI). When the server didn't
             // start an audio sub-stream, stream.audio is null and we skip.
             stream.audio?.let { AudioPlaybackEffect(it, audioFrames) }
+
+            // M6: stacked upload progress cards along the top edge.
+            // Empty list → composable renders nothing.
+            UploadProgressOverlay(
+                uploads = uploads,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(top = 56.dp, end = 12.dp),
+            )
         } else {
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
@@ -215,6 +229,81 @@ private fun ConnectedScreen(
             }
         }
     }
+}
+
+/**
+ * Floating card stack rendered while uploads are in flight (or just
+ * finished). Each card shows filename, progress bar, current speed in
+ * bytes-per-second, and a terminal state badge (✓ / ✗). Cards fade out
+ * 6 s after completion thanks to the ViewModel's auto-prune.
+ */
+@Composable
+private fun UploadProgressOverlay(
+    uploads: List<UploadStatus>,
+    modifier: Modifier = Modifier,
+) {
+    if (uploads.isEmpty()) return
+    Column(
+        modifier = modifier.widthIn(min = 240.dp, max = 320.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        for (u in uploads) {
+            UploadCard(u)
+        }
+    }
+}
+
+@Composable
+private fun UploadCard(u: UploadStatus) {
+    val pct = if (u.totalBytes > 0) {
+        (u.bytesSent.toFloat() / u.totalBytes.toFloat()).coerceIn(0f, 1f)
+    } else 0f
+    val (badge, badgeColor) = when (u.state) {
+        UploadState.Sending -> "上传中" to Color(0xFF1f4d8b)
+        UploadState.Complete -> "✓ 完成" to Color(0xFF2c7a3e)
+        UploadState.Failed -> "✗ 失败" to Color(0xFFB00020)
+    }
+    Column(
+        modifier = Modifier
+            .background(Color(0xE6202020), RoundedCornerShape(10.dp))
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                u.name,
+                color = Color.White,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.weight(1f),
+                maxLines = 1,
+            )
+            Text(badge, color = badgeColor, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+        }
+        Spacer(Modifier.height(6.dp))
+        LinearProgressIndicator(
+            progress = { pct },
+            modifier = Modifier.fillMaxWidth(),
+            color = badgeColor,
+            trackColor = Color(0x33FFFFFF),
+        )
+        Spacer(Modifier.height(4.dp))
+        val subtitle = when (u.state) {
+            UploadState.Sending -> "${humanBytes(u.bytesSent)} / ${humanBytes(u.totalBytes)} · ${(pct * 100).toInt()} %"
+            UploadState.Complete -> u.destPath ?: "已保存"
+            UploadState.Failed -> u.errorReason ?: "未知错误"
+        }
+        Text(subtitle, color = Color(0xFFB0B0B0), fontSize = 11.sp, maxLines = 2)
+    }
+}
+
+private fun humanBytes(b: Long): String = when {
+    b < 1024 -> "$b B"
+    b < 1024L * 1024 -> "%.1f KB".format(b / 1024.0)
+    b < 1024L * 1024 * 1024 -> "%.1f MB".format(b / 1024.0 / 1024.0)
+    else -> "%.1f GB".format(b / 1024.0 / 1024.0 / 1024.0)
 }
 
 /** Walks ContextWrapper chain to the underlying Activity. */

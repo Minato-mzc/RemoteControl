@@ -61,10 +61,11 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Notify};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -77,6 +78,19 @@ struct Args {
     /// Listen address. `0.0.0.0` binds all interfaces.
     #[arg(long, default_value = "0.0.0.0")]
     host: String,
+
+    /// Path to the JSON file used to persist registered hosts across
+    /// relay restarts. Previously the registry lived in memory only and
+    /// `systemctl restart` forced every PC to re-run `--relay-register`
+    /// (and every phone to re-scan the new QR). With this file the
+    /// registry survives restarts — the relay loads it on boot and
+    /// rewrites it atomically after each `host_register`.
+    ///
+    /// Atomic write = `tempfile in same dir → fsync → rename`, so a
+    /// crash mid-write leaves either the old or the new copy intact,
+    /// never a half-written one.
+    #[arg(long, default_value = "relay-hosts.json")]
+    hosts_file: String,
 }
 
 #[tokio::main]
@@ -88,7 +102,19 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let state = Arc::new(RelayState::default());
+    let hosts_file = PathBuf::from(&args.hosts_file);
+    let loaded = load_hosts_from_disk(&hosts_file).await;
+    info!(
+        "loaded {} host(s) from {}",
+        loaded.len(),
+        hosts_file.display()
+    );
+    let state = Arc::new(RelayState {
+        hosts: Mutex::new(loaded),
+        online: Mutex::new(HashMap::new()),
+        next_instance: AtomicU64::new(0),
+        hosts_file,
+    });
 
     let app = Router::new()
         .route("/v1/host/register", post(host_register))
@@ -104,21 +130,89 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Read the on-disk hosts registry. Missing file is fine (cold start);
+/// any other error (permission denied, malformed JSON) is logged and we
+/// fall back to an empty map so the relay can still serve fresh
+/// registrations. We deliberately don't panic — a corrupted hosts file
+/// shouldn't take the whole relay down for everyone.
+async fn load_hosts_from_disk(path: &Path) -> HashMap<String, HostRecord> {
+    let bytes = match tokio::fs::read(path).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            info!("hosts file {} not present — starting empty", path.display());
+            return HashMap::new();
+        }
+        Err(e) => {
+            error!("read {} failed: {} — starting empty", path.display(), e);
+            return HashMap::new();
+        }
+    };
+    match serde_json::from_slice::<HashMap<String, HostRecord>>(&bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            error!(
+                "parse {} failed: {} — starting empty",
+                path.display(),
+                e
+            );
+            HashMap::new()
+        }
+    }
+}
+
+/// Atomic write: dump to a sibling temp file, fsync, rename onto the
+/// target. If we crash mid-write the rename hasn't happened, so the
+/// existing copy survives. Errors are logged but don't propagate —
+/// losing a single persist is annoying (it'll redo itself on the next
+/// register) but should not refuse the register itself, since the
+/// in-memory copy is the live truth either way.
+async fn persist_hosts_to_disk(path: &Path, snapshot: &HashMap<String, HostRecord>) {
+    let json = match serde_json::to_vec_pretty(snapshot) {
+        Ok(b) => b,
+        Err(e) => {
+            error!("serialize hosts failed: {e}");
+            return;
+        }
+    };
+    // Same-dir temp file so the rename stays on one filesystem; cross-
+    // device rename would fail with EXDEV.
+    let tmp = match path.parent() {
+        Some(dir) => dir.join(format!(
+            ".{}.tmp",
+            path.file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("hosts.json")
+        )),
+        None => PathBuf::from(".hosts.json.tmp"),
+    };
+    if let Err(e) = tokio::fs::write(&tmp, &json).await {
+        error!("write {} failed: {e}", tmp.display());
+        return;
+    }
+    // Best-effort fsync of the temp file. If it fails we still attempt
+    // the rename — worst case is a crash window where the file isn't
+    // fully on disk yet, no different from the old in-memory regime.
+    if let Ok(f) = tokio::fs::OpenOptions::new().read(true).open(&tmp).await {
+        let _ = f.sync_all().await;
+    }
+    if let Err(e) = tokio::fs::rename(&tmp, path).await {
+        error!("rename {} -> {} failed: {e}", tmp.display(), path.display());
+    }
+}
+
 // ============================================================================
 // Shared state
 // ============================================================================
 
-#[derive(Default)]
 struct RelayState {
-    /// Long-term host registry. Persists across host disconnects so the
-    /// PC can come back and re-open the WS without re-registering. NOT
-    /// persisted to disk in v1 — relay restart forces re-registration,
-    /// which is cheap (PC keeps `relay.toml` and just calls register
-    /// again on next launch). v2 can drop this to disk if it ever
-    /// matters; for now an in-memory map is plenty.
+    /// Long-term host registry. Persisted to `hosts_file` so `systemctl
+    /// restart` doesn't force every PC to re-run `--relay-register`.
+    /// In-memory copy is the live truth; disk is updated atomically
+    /// (write-tmp-then-rename) after each `host_register`.
     hosts: Mutex<HashMap<String, HostRecord>>,
     /// Live host bookkeeping. Set when the host's WS upgrades, removed
-    /// when it drops. Phones look up their target here.
+    /// when it drops. Phones look up their target here. NOT persisted —
+    /// "currently online" is a runtime fact, not a registration fact.
     online: Mutex<HashMap<String, OnlineHost>>,
     /// Monotonic counter handed out per host_loop on entry. Lets the
     /// loop notice "the entry in `online` is no longer mine" so it
@@ -127,9 +221,11 @@ struct RelayState {
     /// reader exit, `online.remove(host_id)` and silently take down the
     /// new live session.
     next_instance: AtomicU64,
+    /// Where to write the hosts registry. Populated from `--hosts-file`.
+    hosts_file: PathBuf,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct HostRecord {
     /// SHA-256 of the plaintext token. Same trick as the trusted_devices
     /// table on the PC — file leak alone doesn't grant access.
@@ -146,7 +242,16 @@ struct OnlineHost {
     instance: u64,
     /// Anything queued here ends up on the host's WebSocket as a
     /// `TunnelFrame`. The host writer task drains it.
-    to_host: mpsc::UnboundedSender<TunnelFrame>,
+    ///
+    /// Bounded — capacity [`TO_HOST_QUEUE_CAP`]. The unbounded predecessor
+    /// let one misbehaving phone (e.g. a stalled 1GB+ upload) accumulate
+    /// gigabytes of stale frames here while the PC drained at line speed,
+    /// stranding every later phone's `ClientOpen` behind that pile for
+    /// minutes. With a bound, congestion propagates back into the offending
+    /// `client_loop`'s `.send().await`, which propagates back to the
+    /// phone's TCP, which trips the phone-side `waitForBufferRoom` throttle
+    /// — i.e. one phone slows itself down without affecting peers.
+    to_host: mpsc::Sender<TunnelFrame>,
     /// Per-client outbound queues. The host's reader pushes into the
     /// matching entry when it receives a `TunnelFrame::Data` aimed at
     /// `client_id`; the client_loop pumps that queue onto the phone's
@@ -186,6 +291,31 @@ struct PhoneOut {
 /// stale. Past this many frames, the host_loop reader drops new Binary
 /// frames at insertion time rather than queueing forever.
 const PER_CLIENT_QUEUE_CAP: usize = 64;
+
+/// Shared phone→PC queue capacity. All phone sessions on a given host
+/// share this one channel (the host has a single inbound WS, so we have
+/// to serialize anyway). Sized to absorb a brief PC stall — e.g. the
+/// PC's WS sink momentarily stops draining — without forcing the relay
+/// to drop control-plane traffic.
+///
+/// At up to 256 KB per file-chunk frame, 32 slots is ≤8 MiB of
+/// buffering. Two constraints fix the upper bound:
+///   * A new phone's `ClientOpen` has to ride at the back of this FIFO
+///     before the PC sees it. Bigger queue → bigger reconnect latency
+///     under congestion. 8 MiB drains in <1s on a LAN and ~7s on a
+///     10 Mbps PC downlink — both acceptable.
+///   * Phone-side OkHttp ping timeout is 20s. If the relay's reader
+///     blocks for >20s waiting on `to_host` capacity (because the PC
+///     is slow), the phone will tear down its WS as a keepalive
+///     failure. 8 MiB / 1 Mbps ≈ 64s would be too risky; 8 MiB at the
+///     slowest realistic PC downlink (10 Mbps) stays comfortably under
+///     20s.
+///
+/// Past 32 slots, the phone-side `client_loop` blocks in
+/// `.send().await`, which is the back-pressure signal we want: each
+/// phone slows itself down independently, instead of one phone
+/// exhausting RAM for everybody.
+const TO_HOST_QUEUE_CAP: usize = 32;
 
 // ============================================================================
 // Wire formats — binary tunnel framing
@@ -319,13 +449,21 @@ async fn host_register(
     let host_id = uuid::Uuid::new_v4().to_string();
     let token_hash = sha256_hex(host_token.as_bytes());
 
-    state.hosts.lock().await.insert(
-        host_id.clone(),
-        HostRecord {
-            token_hash,
-            name: req.name,
-        },
-    );
+    // Snapshot the registry under the lock so we can release it before
+    // touching the filesystem — disk I/O shouldn't hold the mutex against
+    // concurrent register/host_ws callers.
+    let snapshot = {
+        let mut hosts = state.hosts.lock().await;
+        hosts.insert(
+            host_id.clone(),
+            HostRecord {
+                token_hash,
+                name: req.name,
+            },
+        );
+        hosts.clone()
+    };
+    persist_hosts_to_disk(&state.hosts_file, &snapshot).await;
     info!("host registered  id={host_id}");
     Json(RegisterResp {
         host_id,
@@ -368,7 +506,8 @@ async fn host_ws(
 
 async fn host_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
     let (mut sink, mut stream) = ws.split();
-    let (to_host_tx, mut to_host_rx) = mpsc::unbounded_channel::<TunnelFrame>();
+    let (to_host_tx, mut to_host_rx) =
+        mpsc::channel::<TunnelFrame>(TO_HOST_QUEUE_CAP);
     let clients = Arc::new(Mutex::new(HashMap::<
         String,
         mpsc::Sender<PhoneOut>,
@@ -410,11 +549,35 @@ async fn host_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
     // frame on the wire. Binary instead of Text means video payloads (which
     // are themselves arbitrary binary) travel byte-for-byte without UTF-8
     // validation or base64 inflation.
+    //
+    // Each `sink.send` is bounded at 15 s. This pairs with the bounded
+    // `to_host` channel above: if the PC's TCP buffer is genuinely wedged
+    // (router crash, kernel buffer full, NIC reset), we'd otherwise spin
+    // here forever holding the channel hostage. 15 s matches the per-
+    // client writer's timeout; on a healthy link any single send finishes
+    // in tens of milliseconds.
+    let writer_host_id = host_id.clone();
     let writer = tokio::spawn(async move {
         while let Some(frame) = to_host_rx.recv().await {
             let bytes = frame.encode();
-            if sink.send(Message::Binary(bytes.into())).await.is_err() {
-                break;
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                sink.send(Message::Binary(bytes.into())),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!("host {writer_host_id}: send error: {e}");
+                    break;
+                }
+                Err(_) => {
+                    warn!(
+                        "host {writer_host_id}: send timed out after 15s \
+                         (PC link wedged), disconnecting"
+                    );
+                    break;
+                }
             }
         }
         let _ = sink.close().await;
@@ -579,6 +742,7 @@ async fn client_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
         .send(TunnelFrame::ClientOpen {
             client_id: client_id.clone(),
         })
+        .await
         .is_err()
     {
         // Host's writer already exited → tunnel dead.
@@ -612,7 +776,19 @@ async fn client_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
             tokio::select! {
                 biased;
                 maybe_pong = pong_rx.recv() => {
-                    let Some(payload) = maybe_pong else { continue };
+                    // `None` = the reader dropped `pong_tx` during cleanup
+                    // (phone disconnect). We MUST break here, not continue:
+                    // `biased` polls pong first every iteration, so a closed
+                    // pong_rx makes the select hit this arm every time with
+                    // no awaiting, and `continue` turns into a tight CPU
+                    // spin that never lets `let _ = writer.await` in the
+                    // cleanup path return. The visible symptom is exactly
+                    // the bug we hit in production: the relay's client_loop
+                    // never reaches its "client disconnected" log line, the
+                    // phone keeps showing pings forever, and the PC never
+                    // gets the ClientClose so its run_connection holds the
+                    // stream (and DXGI) hostage for every subsequent peer.
+                    let Some(payload) = maybe_pong else { break };
                     let plen = payload.len();
                     if let Err(e) = sink.send(Message::Pong(payload.into())).await {
                         warn!("client {writer_client_id}: pong send failed: {e}");
@@ -696,6 +872,7 @@ async fn client_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
                 text,
                 payload: bytes,
             })
+            .await
             .is_err()
         {
             break;
@@ -705,9 +882,11 @@ async fn client_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
     drop(pong_tx);
 
     // Cleanup: notify host, drop senders, await writer.
-    let _ = to_host.send(TunnelFrame::ClientClose {
-        client_id: client_id.clone(),
-    });
+    let _ = to_host
+        .send(TunnelFrame::ClientClose {
+            client_id: client_id.clone(),
+        })
+        .await;
     clients.lock().await.remove(&client_id);
     drop(out_tx);
     let _ = writer.await;

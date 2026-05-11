@@ -62,6 +62,7 @@ class MainActivity : ComponentActivity() {
                     val state by vm.connectionState.collectAsStateSafely()
                     val framesReceived by vm.framesReceived.collectAsStateSafely()
                     val trustedServers by vm.trustedServers.collectAsStateSafely()
+                    val uploads by vm.uploads.collectAsStateSafely()
                     val context = LocalContext.current
                     val onUploadFile: (Uri) -> Unit = remember(vm, context) {
                         { uri ->
@@ -120,6 +121,7 @@ class MainActivity : ComponentActivity() {
                         audioFrames = vm.audioFrames,
                         clipboardFromPc = vm.clipboardFromPc,
                         framesReceived = framesReceived,
+                        uploads = uploads,
                         input = input,
                         trustedServers = trustedServers,
                         onScanResult = vm::onQrScanned,

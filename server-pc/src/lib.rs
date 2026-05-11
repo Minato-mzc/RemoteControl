@@ -179,12 +179,42 @@ pub async fn run_server(mode: ServerMode) -> Result<()> {
         }
     };
     let relay_fut = async {
-        if let Some(rcfg) = relay_cfg.clone() {
-            relay_client::RelayClient::new(rcfg)
+        let Some(rcfg) = relay_cfg.clone() else {
+            return futures_util::future::pending::<Result<()>>().await;
+        };
+        // Reconnect loop. `RelayClient::run` is one shot — it returns
+        // when the underlying WS dies (clean close, network failure,
+        // application-level Ping timeout, etc.). We want the user's
+        // PC to keep itself dialable across home network blips, the
+        // relay being restarted, and middlebox-induced silent TCP
+        // drops, so we loop with exponential backoff (capped at 30 s)
+        // and just keep trying forever. The select! above never
+        // resolves on this branch in normal operation — only LAN
+        // failure or qr-server failure tears the whole server down.
+        let mut backoff_secs = 1u64;
+        loop {
+            let start = std::time::Instant::now();
+            match relay_client::RelayClient::new(rcfg.clone())
                 .run(pairing.clone(), trusted.clone(), cfg.clone())
                 .await
-        } else {
-            futures_util::future::pending::<Result<()>>().await
+            {
+                Ok(()) => {
+                    info!("relay tunnel closed cleanly — reconnecting");
+                }
+                Err(e) => {
+                    warn!("relay tunnel error: {e:#} — reconnecting");
+                }
+            }
+            // Reset backoff if we stayed connected for a while.
+            // A flapping connection that dies in <5 s shouldn't ramp
+            // straight back to 1 s retries (that's a tight loop), but
+            // a tunnel that lived for hours and then died once
+            // shouldn't pay a 30 s penalty either.
+            if start.elapsed() >= std::time::Duration::from_secs(60) {
+                backoff_secs = 1;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+            backoff_secs = (backoff_secs * 2).min(30);
         }
     };
     let qr_http_fut = async {
