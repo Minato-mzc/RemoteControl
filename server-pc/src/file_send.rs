@@ -21,22 +21,34 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
-/// Command from the QR HTTP server to the active connection. The HTTP
-/// server has already spooled the upload to a temp file before sending
-/// this; the connection task opens the temp file, streams its contents
-/// to the phone as FILE chunks, and unlinks the temp file on completion
-/// (success OR failure).
+/// Command from the QR HTTP server to the active connection.
 #[derive(Debug)]
-pub struct FileSendCmd {
-    /// Display name (basename only). Goes into `FileSendBegin.name` so
-    /// the phone can show it and pick a destination filename.
-    pub name: String,
-    /// Total file size in bytes. The phone can pre-validate that it has
-    /// enough free space before accepting.
-    pub size: u64,
-    /// Path to the on-disk spool file. Connection task is responsible
-    /// for unlinking it once the transfer is done (or failed).
-    pub temp_path: PathBuf,
+pub enum FileSendCmd {
+    /// Begin a new transfer. The HTTP server has already spooled the
+    /// upload to a temp file and allocated the transfer id; the
+    /// connection task opens the temp file, streams its contents to
+    /// the phone as FILE chunks with this `id`, and unlinks the temp
+    /// file on completion (success OR failure).
+    Send {
+        /// Pre-allocated transfer id. The HTTP server hands this back
+        /// to the browser in the `/send-file` response so a subsequent
+        /// `POST /cancel-send?id=…` can refer to it.
+        id: u32,
+        /// Display name (basename only). Goes into `FileSendBegin.name`
+        /// so the phone can show it and pick a destination filename.
+        name: String,
+        /// Total file size in bytes.
+        size: u64,
+        /// Path to the on-disk spool file. The connection task unlinks
+        /// it once the transfer is done.
+        temp_path: PathBuf,
+    },
+    /// Cancel a transfer the user clicked ✕ on. The connection task
+    /// finds the matching `FileSendState`, flips its cancel flag (the
+    /// streamer notices on its next chunk boundary), and unlinks the
+    /// spool. Phone-side receiver also gets `FileSendFailed` so the
+    /// destination file is cleaned up there too.
+    Cancel { id: u32 },
 }
 
 /// Per-connection registration handle held by `run_connection`. Dropped
@@ -59,6 +71,12 @@ impl BridgeRegistration {
 pub struct FileSendBridge {
     inner: Mutex<Option<(u64, mpsc::UnboundedSender<FileSendCmd>)>>,
     next_instance: AtomicU64,
+    /// Transfer-id generator. Pre-allocated on the HTTP server side
+    /// so `/send-file` can return the id in its JSON response
+    /// (browser needs it for `/cancel-send`). Connection-task-local
+    /// counters would create a TOCTOU: by the time the HTTP handler
+    /// hears back from the connection, the user may have given up.
+    next_transfer_id: std::sync::atomic::AtomicU32,
 }
 
 impl FileSendBridge {
@@ -66,7 +84,23 @@ impl FileSendBridge {
         Arc::new(Self {
             inner: Mutex::new(None),
             next_instance: AtomicU64::new(0),
+            next_transfer_id: std::sync::atomic::AtomicU32::new(1),
         })
+    }
+
+    /// Hand out the next transfer id. Wraps at u32::MAX (≈ 4 billion
+    /// transfers per process lifetime — fine for v1).
+    pub fn allocate_transfer_id(&self) -> u32 {
+        let mut id = self
+            .next_transfer_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if id == 0 {
+            // Skip 0 — we use it elsewhere as a "no transfer" sentinel.
+            id = self
+                .next_transfer_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        id
     }
 
     /// Claim the slot. Returns a registration that the caller is expected

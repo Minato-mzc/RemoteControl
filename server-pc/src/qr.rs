@@ -272,6 +272,13 @@ pub fn build_qr_html(
     .log .row .bar > div {{ height: 100%; width: 0%; background: #1f4d8b;
                             transition: width .15s ease-out; }}
     .log .row.ok .bar, .log .row.err .bar {{ display: none; }}
+    /* Cancel button on each in-flight row. Hidden when the row hits
+       a terminal state — there's nothing to cancel post-completion. */
+    .log .row .cancel {{ cursor: pointer; color: #999; font-size: 13px;
+                         padding: 2px 6px; border-radius: 4px;
+                         user-select: none; }}
+    .log .row .cancel:hover {{ background: #f0f0f0; color: #333; }}
+    .log .row.ok .cancel, .log .row.err .cancel {{ display: none; }}
   </style>
 </head>
 <body>
@@ -318,6 +325,7 @@ pub fn build_qr_html(
         '<span>⏳</span>' +
         '<span class="name"></span>' +
         '<span class="size"></span>' +
+        '<span class="cancel" title="取消">✕</span>' +
         '<div class="bar"><div></div></div>';
       row.querySelector('.name').textContent = file.name;
       row.querySelector('.size').textContent = fmtBytes(file.size);
@@ -353,6 +361,12 @@ pub fn build_qr_html(
     function uploadOne(file) {{
       return new Promise(resolve => {{
         const row = addLogRow(file);
+        // Per-row state for the cancel button. `transferId` is null
+        // while the body is still being POSTed; the server response
+        // fills it in. `cancelled` flips on user click so the onload
+        // handler doesn't overwrite the ✗ with a stray success.
+        let transferId = null;
+        let cancelled = false;
         const xhr = new XMLHttpRequest();
         xhr.open('POST', '/send-file', true);
         xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
@@ -361,16 +375,46 @@ pub fn build_qr_html(
           if (e.lengthComputable) setRowProgress(row, e.loaded / e.total);
         }};
         xhr.onload = () => {{
+          if (cancelled) {{ resolve(); return; }}
           let json;
           try {{ json = JSON.parse(xhr.responseText); }}
           catch (_) {{ json = {{ok:false,reason:'bad response'}}; }}
+          if (json.ok === true && typeof json.id === 'number') {{
+            // The body is fully spooled to the PC server; the
+            // streaming-to-phone phase has begun. Cancel from this
+            // point on goes through /cancel-send rather than aborting
+            // the (already-finished) XHR.
+            transferId = json.id;
+          }}
           setRowStatus(row, json.ok === true, json.reason || ('HTTP ' + xhr.status));
           resolve();
         }};
         xhr.onerror = () => {{
+          if (cancelled) {{ resolve(); return; }}
           setRowStatus(row, false, 'network error');
           resolve();
         }};
+        xhr.onabort = () => {{
+          // We only abort in the cancel path; the status is already
+          // displayed there.
+          resolve();
+        }};
+        row.querySelector('.cancel').addEventListener('click', () => {{
+          if (cancelled) return;
+          cancelled = true;
+          setRowStatus(row, false, '已取消');
+          if (xhr.readyState < 4) {{
+            // Body upload still in flight → abort the XHR so we
+            // don't waste bandwidth pushing the rest. The server
+            // sees the truncated body and bails on its side too.
+            xhr.abort();
+          }} else if (transferId !== null) {{
+            // Streaming-to-phone phase → tell the server to flip
+            // the streamer's cancel flag.
+            fetch('/cancel-send?id=' + transferId, {{ method: 'POST' }})
+              .catch(() => {{ /* best-effort */ }});
+          }}
+        }});
         xhr.send(file);
       }});
     }}

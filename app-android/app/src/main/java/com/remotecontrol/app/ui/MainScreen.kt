@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.ContextWrapper
 import android.content.pm.ActivityInfo
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.ui.platform.LocalView
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -202,6 +203,7 @@ private fun ConnectedScreen(
                 onMacro = input.onMacro,
                 onUploadFile = input.onUploadFile,
                 onShowReceivedFiles = input.onShowReceivedFiles,
+                onToggleDiagnostics = input.onToggleDiagnostics,
                 modifier = Modifier.fillMaxSize(),
             )
 
@@ -210,9 +212,13 @@ private fun ConnectedScreen(
             stream.audio?.let { AudioPlaybackEffect(it, audioFrames) }
 
             // M6: stacked upload progress cards along the top edge.
-            // Empty list → composable renders nothing.
+            // Empty list → composable renders nothing. The cancel
+            // callback piggybacks on `InputCallbacks` so the same
+            // plumbing path that delivers mouse / keyboard events
+            // delivers the ✕ click on a card.
             UploadProgressOverlay(
                 uploads = uploads,
+                onCancel = input.onCancelTransfer,
                 modifier = Modifier
                     .align(Alignment.TopEnd)
                     .padding(top = 56.dp, end = 12.dp),
@@ -241,6 +247,7 @@ private fun ConnectedScreen(
 @Composable
 private fun UploadProgressOverlay(
     uploads: List<UploadStatus>,
+    onCancel: (Int) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     if (uploads.isEmpty()) return
@@ -249,13 +256,13 @@ private fun UploadProgressOverlay(
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         for (u in uploads) {
-            UploadCard(u)
+            UploadCard(u, onCancel = onCancel)
         }
     }
 }
 
 @Composable
-private fun UploadCard(u: UploadStatus) {
+private fun UploadCard(u: UploadStatus, onCancel: (Int) -> Unit) {
     val pct = if (u.totalBytes > 0) {
         (u.bytesSent.toFloat() / u.totalBytes.toFloat()).coerceIn(0f, 1f)
     } else 0f
@@ -289,6 +296,19 @@ private fun UploadCard(u: UploadStatus) {
                 maxLines = 1,
             )
             Text(badge, color = badgeColor, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+            // Cancel button — only while still in flight. Hidden on
+            // Complete / Failed because there's nothing to cancel.
+            if (u.state == UploadState.Sending) {
+                Text(
+                    "✕",
+                    color = Color(0xFFB0B0B0),
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier
+                        .padding(start = 4.dp)
+                        .clickable { onCancel(u.id) },
+                )
+            }
         }
         Spacer(Modifier.height(6.dp))
         LinearProgressIndicator(

@@ -104,21 +104,52 @@ class H264Player {
         val ht = HandlerThread("RC/Player-render").also { it.start() }
         renderThread = ht
         renderHandler = Handler(ht.looper)
-        // Minimal format. Surface output mode doesn't need COLOR_FORMAT;
-        // KEY_LOW_LATENCY occasionally trips drivers on older devices and the
-        // gain is small for our use case.
-        val format = MediaFormat.createVideoFormat(mime, width, height)
-        return try {
+        // Configure the codec, optionally with `KEY_LOW_LATENCY` on
+        // API 30+. On PLR-AL30 (HarmonyOS, HiSilicon) the default
+        // configure path swallows ~300 input frames before producing
+        // output #1, costing ~10 s of black screen at every reconnect.
+        // Low-latency cuts that to under a second on devices that
+        // honour the flag — but the vendor decoder on some Huawei
+        // builds reports API 30 yet rejects the option with a generic
+        // `0x80001001` from `configure()`, so we try the low-latency
+        // path first and silently fall back to the legacy format
+        // without retrying any other settings.
+        fun buildFormat(lowLatency: Boolean): MediaFormat {
+            val f = MediaFormat.createVideoFormat(mime, width, height)
+            // `KEY_OPERATING_RATE = INT_MAX` and `KEY_PRIORITY = 0`
+            // request realtime / max-clock from the decoder up front.
+            // On HiSilicon (HarmonyOS) this is what actually shrinks
+            // the configure→first-output gap from ~10 s to ~1 s — the
+            // vendor decoder otherwise idles in a low-power state and
+            // takes ages to clock up to real-time work. Both keys are
+            // standard since API 23 (operating rate) / API 23
+            // (priority), so no version gate is needed.
+            f.setInteger(MediaFormat.KEY_OPERATING_RATE, Int.MAX_VALUE)
+            f.setInteger(MediaFormat.KEY_PRIORITY, 0)
+            if (
+                lowLatency &&
+                android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R
+            ) {
+                f.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+            }
+            return f
+        }
+        fun configureCodec(lowLatency: Boolean): MediaCodec {
             val c = MediaCodec.createDecoderByType(mime)
             c.setCallback(buildCallback())
-            // (Diagnostic OnFrameRenderedListener removed after we
-            // confirmed via field testing that some hardware codecs
-            // ignore `releaseOutputBuffer(idx, renderTimeNs)` and
-            // render ASAP. The actual fix is in
-            // `onOutputBufferAvailable` below: we manually delay the
-            // immediate-render call via a background `Handler`.)
-            c.configure(format, surface, null, 0)
+            c.configure(buildFormat(lowLatency), surface, null, 0)
             c.start()
+            return c
+        }
+        return try {
+            val c = try {
+                configureCodec(lowLatency = true)
+            } catch (e: Exception) {
+                Log.w(TAG, "low-latency configure failed (${e.message}); retrying without")
+                // Codec.create may have leaked the half-initialised
+                // instance; build a fresh one for the fallback.
+                configureCodec(lowLatency = false)
+            }
             codec = c
             // Don't reset `sawKeyframe` here — `stop()` already does, and
             // resetting again would clobber the flag that `feed()` may

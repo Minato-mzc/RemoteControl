@@ -137,6 +137,21 @@ class ConnectionClient(
     /** Cumulative count of binary video frames received, exposed for UI debug overlay. */
     val receivedFrameCount = AtomicLong(0)
 
+    /** Cumulative bytes received on the WS (all message types combined).
+     *  Snapshotted on a 250 ms cadence by the ViewModel to compute the
+     *  diagnostic overlay's bitrate. */
+    val receivedBytes = AtomicLong(0)
+
+    /** Wall-clock millis at which the most recent VIDEO frame's
+     *  payload landed in `onMessage`. Used by the overlay's "frame age"
+     *  field — a long gap here is the most direct visible signal that
+     *  the screen has frozen. -1 = no frame received yet this session. */
+    val lastVideoFrameTs = AtomicLong(-1)
+
+    /** Latest measured round-trip time, computed from a `Pong` echoing
+     *  back our `Ping.ts`. -1 = no pong received yet this session. */
+    val lastRttMs = AtomicLong(-1)
+
     /**
      * A/V sync rendezvous. OpusPlayer publishes the wall-clock + source-PTS
      * of the first audible audio sample here; H264Player reads it on the
@@ -348,6 +363,16 @@ class ConnectionClient(
         ws.send(ProtoJson.encodeToString(ClientMsg.serializer(), ClipboardSet(text)))
     }
 
+    /** Diagnostic Ping — PC echoes the timestamp back in a Pong, and
+     *  the Pong handler computes round-trip time. Cheap (under
+     *  ~30 bytes on the wire), so the ViewModel calls this every 2 s
+     *  whenever a session is active. */
+    fun sendPing() {
+        val ws = webSocket ?: return
+        val now = System.currentTimeMillis()
+        ws.send(ProtoJson.encodeToString(ClientMsg.serializer(), Ping(ts = now)))
+    }
+
     fun sendClipboardGet() {
         val ws = webSocket ?: return
         ws.send(ProtoJson.encodeToString(ClientMsg.serializer(), ClipboardGet()))
@@ -399,6 +424,9 @@ class ConnectionClient(
             return -1
         }
         val id = nextTransferId.getAndIncrement()
+        // Register a cancel flag the streamer thread can poll.
+        val cancelFlag = java.util.concurrent.atomic.AtomicBoolean(false)
+        uploadCancelFlags[id] = cancelFlag
         ws.send(ProtoJson.encodeToString(
             ClientMsg.serializer(),
             FileTransferBegin(id = id, name = name, size = size),
@@ -420,6 +448,14 @@ class ConnectionClient(
                     var seq = 0
                     var totalSent = 0L
                     while (true) {
+                        // User-cancel check between chunks. Throwing
+                        // here lands in the existing catch below which
+                        // already sends `FileTransferAbort` to the PC
+                        // and emits a Failed event — we just inject a
+                        // recognizable reason string for the UI.
+                        if (cancelFlag.get()) {
+                            throw java.io.IOException("user cancelled")
+                        }
                         val n = input.read(buf)
                         if (n <= 0) {
                             // EOF — send a zero-length terminator with
@@ -474,12 +510,43 @@ class ConnectionClient(
                     FileTransferAbort(id = id, reason = e.message ?: "io"),
                 ))
                 _fileEvents.tryEmit(FileTransferEvent.Failed(id, e.message ?: "io"))
+            } finally {
+                uploadCancelFlags.remove(id)
             }
         }, "RC/Upload-$id").start()
         return id
     }
 
     private val nextTransferId = java.util.concurrent.atomic.AtomicInteger(1)
+
+    // ---- M6 user-initiated cancellation ----
+    //
+    // Each in-flight outbound upload registers an `AtomicBoolean` in
+    // this map; the upload thread checks it between chunks and bails
+    // out (sending `FileTransferAbort` to the PC) when the user hits
+    // ✕. Removed when the upload finishes (success or failure) so the
+    // map only ever holds live entries.
+    private val uploadCancelFlags =
+        java.util.concurrent.ConcurrentHashMap<Int, java.util.concurrent.atomic.AtomicBoolean>()
+
+    /** Flip the cancel flag for an in-flight phone→PC upload. The
+     *  upload thread sees it on its next iteration, fires
+     *  `FileTransferAbort`, and emits a `Failed` event with the
+     *  reason "user cancelled". No-op if `id` has already finished. */
+    fun cancelUpload(id: Int) {
+        uploadCancelFlags[id]?.set(true)
+        Log.i(TAG, "cancel upload $id requested")
+    }
+
+    /** Cancel an in-flight PC→phone download. Reuses [failIncoming]
+     *  so the on-disk partial file gets unlinked and the phone sends
+     *  `FileSendFailed` back to the PC, which then aborts its
+     *  streamer task. */
+    fun cancelDownload(id: Int) {
+        val st = incomingFiles[id] ?: return
+        Log.i(TAG, "cancel download $id requested")
+        failIncoming(st, "user cancelled")
+    }
 
     // ---- M6 v2: inbound (PC → phone) file receive state ----
 
@@ -718,6 +785,11 @@ class ConnectionClient(
         }
 
         override fun onMessage(ws: WebSocket, text: String) {
+            // Accumulate raw text bytes for the diagnostic overlay's
+            // bitrate counter. UTF-8 byte length of the JSON envelope
+            // is what's actually on the wire, modulo WS framing
+            // overhead which is negligible at our message sizes.
+            receivedBytes.addAndGet(text.length.toLong())
             val msg = try {
                 ProtoJson.decodeFromString(ServerMsg.serializer(), text)
             } catch (e: Exception) {
@@ -742,7 +814,16 @@ class ConnectionClient(
                     _state.value = ConnectionState.Failed(mapErrorCode(msg.code, msg.msg))
                     ws.close(1000, "rejected")
                 }
-                is Pong -> Unit
+                is Pong -> {
+                    // PC echoes the millis we sent in Ping.ts back
+                    // verbatim, so the diff is the round-trip time.
+                    // Server-side processing is ~microseconds, so this
+                    // measures network + WS framing latency end-to-end.
+                    val rtt = System.currentTimeMillis() - msg.ts
+                    if (rtt in 0..10_000) {
+                        lastRttMs.set(rtt)
+                    }
+                }
                 is StreamStarted -> handleStreamStarted(msg)
                 is StreamStopped -> handleStreamStopped(msg)
                 is ClipboardText -> {
@@ -766,6 +847,8 @@ class ConnectionClient(
         }
 
         override fun onMessage(ws: WebSocket, bytes: ByteString) {
+            // Diagnostic overlay: total wire bytes (all types).
+            receivedBytes.addAndGet(bytes.size.toLong())
             val frame = FrameParser.parse(bytes)
             if (frame == null) {
                 Log.w(TAG, "binary frame too short: ${bytes.size} bytes")
@@ -774,6 +857,7 @@ class ConnectionClient(
             when (frame.type) {
                 FrameType.VIDEO -> {
                     receivedFrameCount.incrementAndGet()
+                    lastVideoFrameTs.set(System.currentTimeMillis())
                     _frames.tryEmit(frame)
                 }
                 FrameType.AUDIO -> {

@@ -54,6 +54,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** Total binary video frames the WebSocket has received. UI debug overlay. */
     val framesReceived: StateFlow<Long> = _framesReceived.asStateFlow()
 
+    /** Real-time link metrics for the diagnostic overlay. Updated by
+     *  the sliding-window collector below. */
+    private val _linkMetrics = MutableStateFlow(LinkMetrics())
+    val linkMetrics: StateFlow<LinkMetrics> = _linkMetrics.asStateFlow()
+
     /**
      * Servers we've previously paired with. Idle screen reads this to show
      * "重新连接 ADMIN" buttons. Refreshed on init and after every save.
@@ -82,6 +87,31 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             while (isActive) {
                 _framesReceived.value = client.receivedFrameCount.get()
                 delay(500)
+            }
+        }
+
+        // Periodic Ping for the diagnostic overlay's RTT readout. Only
+        // fires while we have a live Connected state; sleeps cheaply
+        // otherwise. 2 s cadence is a compromise between fresh
+        // readings and not spamming the WS during a file send.
+        viewModelScope.launch {
+            while (isActive) {
+                if (client.state.value is ConnectionState.Connected) {
+                    client.sendPing()
+                }
+                delay(2_000)
+            }
+        }
+
+        // 250 ms metrics loop: sliding 1-second window over the
+        // per-message byte / frame counters to derive fps + bitrate.
+        // The collector itself keeps the deque so the algorithm is
+        // self-contained.
+        viewModelScope.launch {
+            val collector = LinkMetricsCollector(client)
+            while (isActive) {
+                _linkMetrics.value = collector.tick()
+                delay(250)
             }
         }
         // Persist freshly-minted trust tokens so the next app launch can
@@ -200,6 +230,20 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** User pressed the ✕ on a transfer card. Dispatches based on the
+     *  card's `direction` — outbound uploads flip the streamer's
+     *  cancel flag (which then sends `FileTransferAbort` to the PC),
+     *  inbound downloads close the output file and send back
+     *  `FileSendFailed` so the PC stops streaming. No-op for terminal
+     *  cards (the cancel button isn't rendered there). */
+    fun cancelTransfer(id: Int) {
+        val entry = _uploads.value.firstOrNull { it.id == id } ?: return
+        when (entry.direction) {
+            com.remotecontrol.app.net.TransferDirection.Upload -> client.cancelUpload(id)
+            com.remotecontrol.app.net.TransferDirection.Download -> client.cancelDownload(id)
+        }
+    }
+
     /** Trigger an upload. Caller supplies a name + size + a closure that
      *  opens a fresh InputStream over the file (typically
      *  `contentResolver.openInputStream(uri)`). */
@@ -293,6 +337,56 @@ data class UploadStatus(
 }
 
 enum class UploadState { Sending, Complete, Failed }
+
+/** Sliding-1 s-window aggregator over [ConnectionClient]'s cumulative
+ *  byte / frame counters, plus passthrough for `lastRttMs` /
+ *  `lastVideoFrameTs`. Held by a single coroutine, so no thread
+ *  safety on the deque is needed. */
+private class LinkMetricsCollector(private val client: ConnectionClient) {
+    private data class Sample(val timeMs: Long, val bytes: Long, val frames: Long)
+    private val samples = ArrayDeque<Sample>()
+    private val windowMs = 1_000L
+
+    fun tick(): LinkMetrics {
+        val now = System.currentTimeMillis()
+        val bytes = client.receivedBytes.get()
+        val frames = client.receivedFrameCount.get()
+        samples.addLast(Sample(now, bytes, frames))
+        // Trim everything outside the 1-second window. Keep at least
+        // one entry so a `(now - oldest)` div doesn't blow up.
+        while (samples.size > 1 && now - samples.first().timeMs > windowMs) {
+            samples.removeFirst()
+        }
+        val (fps, mbps) = if (samples.size >= 2) {
+            val oldest = samples.first()
+            val dtSec = (now - oldest.timeMs) / 1000.0
+            if (dtSec > 0) {
+                val df = (frames - oldest.frames).toDouble()
+                val db = (bytes - oldest.bytes).toDouble()
+                // Mbps = bytes * 8 bits/byte / 1_000_000 / seconds
+                (df / dtSec).toFloat() to (db * 8.0 / 1_000_000.0 / dtSec).toFloat()
+            } else 0f to 0f
+        } else 0f to 0f
+        val lastFrame = client.lastVideoFrameTs.get()
+        val lastFrameAge = if (lastFrame > 0) now - lastFrame else null
+        val rtt = client.lastRttMs.get().takeIf { it >= 0 }
+        return LinkMetrics(rttMs = rtt, fps = fps, mbps = mbps, lastFrameAgeMs = lastFrameAge)
+    }
+}
+
+/** Snapshot of link health for the diagnostic overlay. Computed every
+ *  ~250 ms from raw counters on [ConnectionClient] over a 1-second
+ *  sliding window so brief jitter doesn't make the readings flicker.
+ *
+ *  Null fields mean "no measurement yet": pre-Pong → `rttMs`, before
+ *  the first video frame → `lastFrameAgeMs`. The UI renders these
+ *  as "—" rather than 0 so the user can tell missing vs zero. */
+data class LinkMetrics(
+    val rttMs: Long? = null,
+    val fps: Float = 0f,
+    val mbps: Float = 0f,
+    val lastFrameAgeMs: Long? = null,
+)
 
 @Composable
 fun <T> StateFlow<T>.collectAsStateSafely(): State<T> = collectAsState()

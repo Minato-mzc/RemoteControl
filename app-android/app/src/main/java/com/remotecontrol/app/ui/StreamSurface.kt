@@ -52,6 +52,16 @@ data class InputCallbacks(
      *  transfers' destinations. Plumbed all the way down to the
      *  keyboard row's "已收文件" button. */
     val onShowReceivedFiles: () -> Unit = {},
+    /** Toggle the diagnostic overlay (RTT / fps / Mbps / frame age).
+     *  Wired to the keyboard row's "📊 诊断" button. The actual
+     *  show/hide state lives in MainScreen so collapsing the keyboard
+     *  panel doesn't dismiss the overlay. */
+    val onToggleDiagnostics: () -> Unit = {},
+    /** User-initiated cancel for an in-flight transfer, identified by
+     *  its `transfer_id`. The ViewModel dispatches based on the
+     *  card's direction (outbound → flag the streamer; inbound → fail
+     *  the receiver and tell the PC to stop sending). */
+    val onCancelTransfer: (Int) -> Unit = {},
 )
 
 @Composable

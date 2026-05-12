@@ -89,6 +89,7 @@ class MainActivity : ComponentActivity() {
                     // overlay (or temporarily backgrounding the app)
                     // doesn't dismiss it.
                     var showReceivedFiles by remember { mutableStateOf(false) }
+                    var showDiagnostics by remember { mutableStateOf(false) }
                     val input = remember(vm, onUploadFile) {
                         InputCallbacks(
                             onMove = vm::sendMouseMove,
@@ -101,8 +102,11 @@ class MainActivity : ComponentActivity() {
                             onMacro = vm::runMacro,
                             onUploadFile = onUploadFile,
                             onShowReceivedFiles = { showReceivedFiles = true },
+                            onToggleDiagnostics = { showDiagnostics = !showDiagnostics },
+                            onCancelTransfer = vm::cancelTransfer,
                         )
                     }
+                    val linkMetrics by vm.linkMetrics.collectAsStateSafely()
                     // Surface upload progress / completion / failure as
                     // toasts. Lives at this scope so the messages keep
                     // showing even if the user collapses the keyboard
@@ -144,6 +148,19 @@ class MainActivity : ComponentActivity() {
                         com.remotecontrol.app.ui.ReceivedFilesSheet(
                             downloadsDir = vm.downloadsDir,
                             onDismiss = { showReceivedFiles = false },
+                        )
+                    }
+                    // E: floating diagnostic overlay. Drawn on top of
+                    // every other UI element so it's always visible
+                    // when toggled on AND a session is live — gating
+                    // on Connected hides stale metrics on the idle/
+                    // trust-list screen without forgetting that the
+                    // user wanted it on, so a reconnect brings it
+                    // back automatically.
+                    if (showDiagnostics && state is com.remotecontrol.app.model.ConnectionState.Connected) {
+                        com.remotecontrol.app.ui.DiagnosticsOverlay(
+                            metrics = linkMetrics,
+                            onDismiss = { showDiagnostics = false },
                         )
                     }
                 }

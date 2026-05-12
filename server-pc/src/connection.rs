@@ -115,7 +115,6 @@ pub async fn run_connection(
     // sender ready so the registration is atomic. Stash this for use
     // after the first successful handshake. See `register_bridge_once`
     // closure below.
-    let mut next_file_send_id: u32 = 1;
     let mut bridge_registration: Option<crate::file_send::BridgeRegistration> = None;
 
     // Watchdog: if no inbound message arrives in this window, treat the
@@ -340,17 +339,38 @@ pub async fn run_connection(
                     warn!(
                         "{peer_label}: file_send_cmd arrived pre-auth; dropping"
                     );
-                    let _ = tokio::fs::remove_file(&cmd.temp_path).await;
+                    if let crate::file_send::FileSendCmd::Send { temp_path, .. } = &cmd {
+                        let _ = tokio::fs::remove_file(temp_path).await;
+                    }
                     continue;
                 }
-                dispatch_file_send_cmd(
-                    cmd,
-                    &peer_label,
-                    &mut next_file_send_id,
-                    &mut file_sends,
-                    &outbox,
-                    &outbox_bulk,
-                ).await;
+                match cmd {
+                    crate::file_send::FileSendCmd::Send { id, name, size, temp_path } => {
+                        dispatch_file_send_cmd(
+                            id, name, size, temp_path,
+                            &peer_label,
+                            &mut file_sends,
+                            &outbox,
+                            &outbox_bulk,
+                        ).await;
+                    }
+                    crate::file_send::FileSendCmd::Cancel { id } => {
+                        if let Some(st) = file_sends.remove(&id) {
+                            st.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                            let _ = tokio::fs::remove_file(&st.temp_path).await;
+                            info!(
+                                "{peer_label}: send {id} ({}) cancelled by user",
+                                st.name
+                            );
+                        } else {
+                            // Either id was completed already or never
+                            // existed. Either is fine; no-op.
+                            info!(
+                                "{peer_label}: cancel for unknown send {id} (already finished?)"
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -1123,22 +1143,22 @@ fn spawn_file_sender(
 /// streamer — for the metadata path we trust the HTTP server having
 /// already spooled the file.
 async fn dispatch_file_send_cmd(
-    cmd: crate::file_send::FileSendCmd,
+    id: u32,
+    name: String,
+    size: u64,
+    temp_path: std::path::PathBuf,
     peer_label: &str,
-    next_id: &mut u32,
     sends: &mut std::collections::HashMap<u32, FileSendState>,
     outbox: &OutboundTx,
     outbox_bulk: &OutboundBulkTx,
 ) {
-    let id = *next_id;
-    *next_id = next_id.wrapping_add(1).max(1); // skip 0 just to keep "no transfer" sentinel-able
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     sends.insert(
         id,
         FileSendState {
-            name: cmd.name.clone(),
-            temp_path: cmd.temp_path.clone(),
-            expected_size: cmd.size,
+            name: name.clone(),
+            temp_path: temp_path.clone(),
+            expected_size: size,
             dest_path: None,
             cancel: cancel.clone(),
         },
@@ -1147,21 +1167,21 @@ async fn dispatch_file_send_cmd(
         outbox,
         ServerMsg::FileSendBegin {
             id,
-            name: cmd.name.clone(),
-            size: cmd.size,
+            name: name.clone(),
+            size,
         },
     );
     info!(
         "{peer_label}: send {id} begin: {} ({} bytes) from {}",
-        cmd.name,
-        cmd.size,
-        cmd.temp_path.display()
+        name,
+        size,
+        temp_path.display()
     );
     spawn_file_sender(
         id,
-        cmd.name,
-        cmd.temp_path,
-        cmd.size,
+        name,
+        temp_path,
+        size,
         peer_label.to_string(),
         outbox_bulk.clone(),
         cancel,

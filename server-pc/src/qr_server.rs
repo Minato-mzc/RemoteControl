@@ -126,6 +126,9 @@ async fn handle_conn(stream: TcpStream, args: Arc<QrServerArgs>) -> Result<()> {
         ("POST", "/send-file") => {
             handle_send_file(&mut read, &mut write, &headers, &args).await
         }
+        ("POST", p) if p.starts_with("/cancel-send") => {
+            handle_cancel_send(&mut write, p, &args).await
+        }
         ("GET", "/favicon.ico") => {
             send_response(&mut write, 404, "Not Found", None, "").await
         }
@@ -237,15 +240,27 @@ async fn handle_send_file(
         f.flush().await.with_context(|| "flush temp spool")?;
     }
 
-    let cmd = FileSendCmd {
+    // Allocate the transfer id BEFORE we hand off to the connection
+    // task so we can echo it back to the browser in the response —
+    // the browser uses it for a later `/cancel-send` if the user
+    // clicks ✕.
+    let id = args.file_send_bridge.allocate_transfer_id();
+    let cmd = FileSendCmd::Send {
+        id,
         name: display_name.clone(),
         size: len,
         temp_path: temp_path.clone(),
     };
     match args.file_send_bridge.dispatch(cmd).await {
         Ok(()) => {
-            info!("send-file accepted: {} ({} bytes) → spool {}", display_name, len, temp_path.display());
-            send_json(write, 200, "OK", r#"{"ok":true}"#).await
+            info!(
+                "send-file accepted (id={id}): {} ({} bytes) → spool {}",
+                display_name,
+                len,
+                temp_path.display(),
+            );
+            let body = format!(r#"{{"ok":true,"id":{id}}}"#);
+            send_json(write, 200, "OK", &body).await
         }
         Err(reason) => {
             // Race: session went away between the dry-run and the
@@ -255,6 +270,53 @@ async fn handle_send_file(
             send_json(write, 503, "Service Unavailable", &body).await
         }
     }
+}
+
+/// `POST /cancel-send?id=N` — flip the cancel flag on an in-flight
+/// PC→phone transfer. Returns 200 even for unknown / already-finished
+/// ids so the browser can fire-and-forget on the ✕ click without
+/// having to disambiguate phases of the upload.
+async fn handle_cancel_send(
+    write: &mut OwnedWriteHalf,
+    path_query: &str,
+    args: &QrServerArgs,
+) -> Result<()> {
+    let id = match parse_id_query(path_query) {
+        Some(id) => id,
+        None => {
+            return send_json(
+                write,
+                400,
+                "Bad Request",
+                r#"{"ok":false,"reason":"missing id"}"#,
+            )
+            .await;
+        }
+    };
+    // Best-effort: if there's no live session, the request quietly
+    // succeeds — the spool (if any) was already cleaned by /send-file
+    // dispatch failure, and the streamer (if any) is already done.
+    match args.file_send_bridge.dispatch(FileSendCmd::Cancel { id }).await {
+        Ok(()) => {
+            info!("cancel-send: dispatched cancel for id={id}");
+        }
+        Err(_) => {
+            info!("cancel-send: no active session for id={id}, ignored");
+        }
+    }
+    send_json(write, 200, "OK", r#"{"ok":true}"#).await
+}
+
+/// Parse `?id=<u32>` out of a request-line path. Quick-and-dirty: only
+/// handles the one query param we care about, no general URL decoding.
+fn parse_id_query(path: &str) -> Option<u32> {
+    let q = path.split_once('?')?.1;
+    for kv in q.split('&') {
+        if let Some(v) = kv.strip_prefix("id=") {
+            return v.parse().ok();
+        }
+    }
+    None
 }
 
 /// Minimal percent-decoder for `X-File-Name`. Only handles `%XX`

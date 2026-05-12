@@ -79,6 +79,7 @@ fun KeyboardOverlay(
     onMacro: (Macro) -> Unit,
     onUploadFile: (android.net.Uri) -> Unit,
     onShowReceivedFiles: () -> Unit,
+    onToggleDiagnostics: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var expanded by remember { mutableStateOf(false) }
@@ -114,6 +115,7 @@ fun KeyboardOverlay(
                 onMacro = onMacro,
                 onUploadFile = onUploadFile,
                 onShowReceivedFiles = onShowReceivedFiles,
+                onToggleDiagnostics = onToggleDiagnostics,
                 onClose = { expanded = false },
                 modifier = Modifier.align(Alignment.BottomCenter),
             )
@@ -131,6 +133,7 @@ private fun ExpandedPanel(
     onMacro: (Macro) -> Unit,
     onUploadFile: (android.net.Uri) -> Unit,
     onShowReceivedFiles: () -> Unit,
+    onToggleDiagnostics: () -> Unit,
     onClose: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -217,6 +220,9 @@ private fun ExpandedPanel(
             // collapsed (e.g. user backgrounds the keyboard but wants
             // the file list to stay open).
             KKey("已收文件") { onShowReceivedFiles() }
+            // E: real-time link diagnostics overlay. Toggle stays
+            // visible across keyboard-panel collapses.
+            KKey("📊 诊断") { onToggleDiagnostics() }
         }
 
         // Macro row: common Windows shortcuts in one tap.
