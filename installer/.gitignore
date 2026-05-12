@@ -1,0 +1,4 @@
+# Generated during the build pipeline — see build-installer.ps1.
+icon.ico
+vendor/MicrosoftEdgeWebview2Setup.exe
+dist/

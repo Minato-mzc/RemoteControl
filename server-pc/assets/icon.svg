@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  RemoteControl PC server icon. Visually paired with the Android launcher
+  adaptive icon at app-android/.../ic_launcher_foreground.xml — same palette
+  (#0F172A background, #60A5FA phone frame, #F8FAFC content lines), same
+  108-unit viewport, same phone glyph centered in the 21..87 safe zone.
+
+  Rendered by server-pc/build.rs at compile time into a multi-resolution
+  .ico (16/24/32/48/64/128/256) and embedded into the exe via embed-resource.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108">
+  <rect width="108" height="108" fill="#0F172A"/>
+  <path fill="#60A5FA" d="M42,30 L66,30 A4,4 0,0,1 70,34 L70,74 A4,4 0,0,1 66,78 L42,78 A4,4 0,0,1 38,74 L38,34 A4,4 0,0,1 42,30 Z M42,36 L42,70 L66,70 L66,36 Z M50,73 L58,73 L58,75 L50,75 Z"/>
+  <path fill="#F8FAFC" d="M46,44 L62,44 L62,46 L46,46 Z M46,50 L62,50 L62,52 L46,52 Z M46,56 L54,56 L54,58 L46,58 Z"/>
+</svg>

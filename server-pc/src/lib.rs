@@ -14,6 +14,7 @@ pub mod tray;
 pub mod input;
 pub mod net;
 pub mod pairing;
+pub mod paths;
 pub mod protocol;
 pub mod qr;
 pub mod qr_server;

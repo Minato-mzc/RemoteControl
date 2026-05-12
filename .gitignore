@@ -20,6 +20,19 @@ app-android/app/build/
 app-android/captures/
 app-android/.externalNativeBuild
 app-android/.cxx
+# Release signing — keystore is the private key for the published app
+# identity; passwords live in keystore.properties next to it. Losing
+# either means the same package can never publish an update again,
+# but committing them is even worse. Both must stay local.
+*.jks
+*.keystore
+keystore.properties
+
+# ---- Release artifacts ----
+# Populated by installer/build-installer.ps1 — signed installer .exe,
+# standalone server .exe, and signed Android APK. All regenerable,
+# none of them belong in git.
+/dist/
 
 # ---- Misc ----
 .vscode/

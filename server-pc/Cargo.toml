@@ -1,6 +1,6 @@
 [package]
 name = "remotecontrol-server"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Windows PC server for phone remote control"
 # NVENC SDK direct integration (M4-B): bindgen runs in build.rs against
@@ -17,6 +17,14 @@ path = "src/lib.rs"
 
 [build-dependencies]
 bindgen = "0.70"
+# Render assets/icon.svg → multi-resolution icon.ico at build time and
+# embed it (plus a VS_VERSIONINFO block) into the exe. Lets us keep one
+# SVG source of truth without committing a binary .ico alongside it.
+resvg = "0.44"
+tiny-skia = "0.11"
+usvg = "0.44"
+ico = "0.3"
+embed-resource = "2.5"
 
 [dev-dependencies]
 tempfile = "3"
@@ -37,6 +45,10 @@ anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Daily-rolling file logger so release builds (which run under the
+# Windows GUI subsystem and therefore have no console) still have
+# inspectable logs at %LOCALAPPDATA%\RemoteControl\logs\server.log.*
+tracing-appender = "0.2"
 
 rand = "0.8"
 base64 = "0.22"
@@ -91,6 +103,10 @@ windows = { version = "0.58", features = [
     # event objects to wait on async encoder output instead of polling.
     "Win32_System_LibraryLoader",
     "Win32_System_SystemServices",
+    # AttachConsole(ATTACH_PARENT_PROCESS) — release builds run under
+    # the GUI subsystem but still tee logs into the caller's terminal
+    # when launched from cmd.exe / PowerShell.
+    "Win32_System_Console",
     "Win32_Security",
     "Win32_Media_MediaFoundation",
     "Win32_Media_KernelStreaming",

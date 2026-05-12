@@ -85,16 +85,19 @@ pub fn run_tray_loop(state: Arc<TrayState>) -> anyhow::Result<()> {
     let sep1 = PredefinedMenuItem::separator();
     let item_open_qr = MenuItem::new("📷 打开二维码页", true, None);
     let item_refresh = MenuItem::new("🔄 刷新二维码", true, None);
+    let item_open_logs = MenuItem::new("📂 打开日志文件夹", true, None);
     let sep2 = PredefinedMenuItem::separator();
     let item_quit = MenuItem::new("❌ 退出", true, None);
     let id_open_qr = item_open_qr.id().clone();
     let id_refresh = item_refresh.id().clone();
+    let id_open_logs = item_open_logs.id().clone();
     let id_quit = item_quit.id().clone();
     menu.append_items(&[
         &item_title,
         &sep1,
         &item_open_qr,
         &item_refresh,
+        &item_open_logs,
         &sep2,
         &item_quit,
     ])?;
@@ -175,6 +178,9 @@ pub fn run_tray_loop(state: Arc<TrayState>) -> anyhow::Result<()> {
                         }
                     }
                 }
+                id if *id == id_open_logs => {
+                    open_logs_folder();
+                }
                 id if *id == id_quit => {
                     info!("tray: exit requested");
                     state.shutdown.store(true, Ordering::Relaxed);
@@ -239,6 +245,26 @@ impl QrWindow {
             .build()?;
         Ok(Self { window, webview })
     }
+}
+
+/// Open `%LOCALAPPDATA%\RemoteControl\logs\` in Explorer. The folder is
+/// created on first launch by `init_tracing`, so by the time the user
+/// can click this menu item it always exists. We swallow errors — the
+/// worst case is a no-op click, which is preferable to crashing the
+/// tray loop over a missing folder.
+fn open_logs_folder() {
+    let log_dir = match crate::paths::log_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("resolve log dir: {e:#}");
+            return;
+        }
+    };
+    // `cmd /C start "" <path>` — the empty title arg is mandatory; without
+    // it `start` interprets a quoted path as a window title and fails.
+    let _ = std::process::Command::new("cmd")
+        .args(["/C", "start", "", log_dir.to_string_lossy().as_ref()])
+        .spawn();
 }
 
 /// 16×16 hand-painted RGBA icon, modeled on a real-phone silhouette
