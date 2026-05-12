@@ -69,18 +69,24 @@ Source: "..\target\release\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversio
 Source: "vendor\MicrosoftEdgeWebview2Setup.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall
 
 [Icons]
-Name: "{group}\{#AppName}";       Filename: "{app}\{#AppExeName}"
+; --relay on every entry point so shortcuts, autostart, and the
+; postinstall launch all bring up the cross-network mode by default.
+; Phones on the same LAN still take the direct path (the combined QR
+; carries both endpoints); on cellular / different WiFi the phone
+; falls back to the relay automatically.
+Name: "{group}\{#AppName}";       Filename: "{app}\{#AppExeName}"; Parameters: "--relay"
 Name: "{group}\卸载 {#AppName}";  Filename: "{uninstallexe}"
 ; {autodesktop} = per-user desktop in lowest mode, all-users desktop
 ; if the wizard's "Install for all users" override was taken.
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Parameters: "--relay"; Tasks: desktopicon
 
 [Registry]
 ; HKCU Run entry — survives Windows reboots, doesn't need admin to
 ; remove (uninstaller drops it via uninsdeletevalue). Quoted path so
-; "Program Files" doesn't confuse the parser at logon.
+; "Program Files" doesn't confuse the parser at logon. `--relay` so
+; the boot-time instance can serve phones outside the LAN too.
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
-    ValueType: string; ValueName: "{#AppName}"; ValueData: """{app}\{#AppExeName}"""; \
+    ValueType: string; ValueName: "{#AppName}"; ValueData: """{app}\{#AppExeName}"" --relay"; \
     Tasks: autostart; Flags: uninsdeletevalue
 
 [Run]
@@ -93,8 +99,9 @@ Filename: "{tmp}\MicrosoftEdgeWebview2Setup.exe"; \
     Check: NeedsWebView2
 
 ; Launch right after install. skipifsilent so /VERYSILENT installs
-; (deploy scripts) don't pop a window.
+; (deploy scripts) don't pop a window. --relay matches the shortcuts.
 Filename: "{app}\{#AppExeName}"; \
+    Parameters: "--relay"; \
     Description: "立即启动 {#AppName}"; \
     Flags: nowait postinstall skipifsilent
 
