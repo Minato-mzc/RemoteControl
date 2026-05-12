@@ -167,6 +167,22 @@ async fn handle_send_file(
     if len == 0 {
         return send_json(write, 400, "Bad Request", r#"{"ok":false,"reason":"empty file"}"#).await;
     }
+    // Hard cap on spool size. The local temp directory has to hold
+    // the entire body before we hand it off to the streamer, so an
+    // accidental 50 GiB drop would silently fill the user's disk
+    // and brick the PC. 5 GiB is plenty for the casual screenshots
+    // / videos / installers the dialog is designed for; anything
+    // larger should go over a real file-transfer tool.
+    const MAX_SPOOL_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+    if len > MAX_SPOOL_BYTES {
+        return send_json(
+            write,
+            413,
+            "Payload Too Large",
+            r#"{"ok":false,"reason":"文件超过 5 GiB 上限"}"#,
+        )
+        .await;
+    }
     let display_name = get_header("x-file-name")
         .map(|s| percent_decode(s))
         .unwrap_or_else(|| "upload.bin".to_string());

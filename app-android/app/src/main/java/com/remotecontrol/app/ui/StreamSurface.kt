@@ -48,6 +48,10 @@ data class InputCallbacks(
     val onClipboardPull: () -> Unit = {},
     val onMacro: (Macro) -> Unit = {},
     val onUploadFile: (android.net.Uri) -> Unit = {},
+    /** Open the "received files" bottom sheet listing PC→phone
+     *  transfers' destinations. Plumbed all the way down to the
+     *  keyboard row's "已收文件" button. */
+    val onShowReceivedFiles: () -> Unit = {},
 )
 
 @Composable

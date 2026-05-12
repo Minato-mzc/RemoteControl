@@ -78,6 +78,7 @@ fun KeyboardOverlay(
     onClipboardPull: () -> Unit,
     onMacro: (Macro) -> Unit,
     onUploadFile: (android.net.Uri) -> Unit,
+    onShowReceivedFiles: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var expanded by remember { mutableStateOf(false) }
@@ -112,6 +113,7 @@ fun KeyboardOverlay(
                 onClipboardPull = onClipboardPull,
                 onMacro = onMacro,
                 onUploadFile = onUploadFile,
+                onShowReceivedFiles = onShowReceivedFiles,
                 onClose = { expanded = false },
                 modifier = Modifier.align(Alignment.BottomCenter),
             )
@@ -128,6 +130,7 @@ private fun ExpandedPanel(
     onClipboardPull: () -> Unit,
     onMacro: (Macro) -> Unit,
     onUploadFile: (android.net.Uri) -> Unit,
+    onShowReceivedFiles: () -> Unit,
     onClose: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -209,6 +212,11 @@ private fun ExpandedPanel(
                 if (uri != null) onUploadFile(uri)
             }
             KKey("上传文件") { pickFile.launch("*/*") }
+            // M6 v2: shortcut to the inbound-file list. The dialog is
+            // hosted by MainScreen so it survives this overlay being
+            // collapsed (e.g. user backgrounds the keyboard but wants
+            // the file list to stay open).
+            KKey("已收文件") { onShowReceivedFiles() }
         }
 
         // Macro row: common Windows shortcuts in one tap.

@@ -12,7 +12,9 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import com.remotecontrol.app.net.FileTransferEvent
@@ -82,6 +84,11 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                     }
+                    // M6 v2: state for the "received files" bottom sheet.
+                    // Hosted at activity scope so collapsing the keyboard
+                    // overlay (or temporarily backgrounding the app)
+                    // doesn't dismiss it.
+                    var showReceivedFiles by remember { mutableStateOf(false) }
                     val input = remember(vm, onUploadFile) {
                         InputCallbacks(
                             onMove = vm::sendMouseMove,
@@ -93,6 +100,7 @@ class MainActivity : ComponentActivity() {
                             onClipboardPull = vm::sendClipboardGet,
                             onMacro = vm::runMacro,
                             onUploadFile = onUploadFile,
+                            onShowReceivedFiles = { showReceivedFiles = true },
                         )
                     }
                     // Surface upload progress / completion / failure as
@@ -132,6 +140,12 @@ class MainActivity : ComponentActivity() {
                         onDisconnect = vm::disconnect,
                         onResetError = vm::resetError,
                     )
+                    if (showReceivedFiles) {
+                        com.remotecontrol.app.ui.ReceivedFilesSheet(
+                            downloadsDir = vm.downloadsDir,
+                            onDismiss = { showReceivedFiles = false },
+                        )
+                    }
                 }
             }
         }

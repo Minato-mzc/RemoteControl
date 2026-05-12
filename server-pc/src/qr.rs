@@ -265,6 +265,13 @@ pub fn build_qr_html(
     .log .row .name {{ flex: 1; font-family: ui-monospace, Consolas, monospace;
                        font-size: 12px; word-break: break-all; }}
     .log .row .size {{ color: #888; font-size: 11px; white-space: nowrap; }}
+    /* Per-row progress bar. Animates 0→100% as the browser streams the
+       file body; hidden on terminal state (ok / err). */
+    .log .row .bar {{ flex-basis: 100%; height: 4px; background: #eee;
+                      border-radius: 2px; overflow: hidden; margin-top: 4px; }}
+    .log .row .bar > div {{ height: 100%; width: 0%; background: #1f4d8b;
+                            transition: width .15s ease-out; }}
+    .log .row.ok .bar, .log .row.err .bar {{ display: none; }}
   </style>
 </head>
 <body>
@@ -307,7 +314,11 @@ pub fn build_qr_html(
     function addLogRow(file) {{
       const row = document.createElement('div');
       row.className = 'row';
-      row.innerHTML = '<span>⏳</span><span class="name"></span><span class="size"></span>';
+      row.innerHTML =
+        '<span>⏳</span>' +
+        '<span class="name"></span>' +
+        '<span class="size"></span>' +
+        '<div class="bar"><div></div></div>';
       row.querySelector('.name').textContent = file.name;
       row.querySelector('.size').textContent = fmtBytes(file.size);
       log.prepend(row);
@@ -327,26 +338,51 @@ pub fn build_qr_html(
       }}
     }}
 
-    async function uploadOne(file) {{
-      const row = addLogRow(file);
-      try {{
-        const res = await fetch('/send-file', {{
-          method: 'POST',
-          headers: {{
-            'X-File-Name': encodeURIComponent(file.name),
-            'Content-Type': 'application/octet-stream',
-          }},
-          body: file,
-        }});
-        const json = await res.json().catch(() => ({{ok:false,reason:'bad response'}}));
-        setRowStatus(row, json.ok === true, json.reason || ('HTTP ' + res.status));
-      }} catch (e) {{
-        setRowStatus(row, false, String(e));
-      }}
+    function setRowProgress(row, fraction) {{
+      const fill = row.querySelector('.bar > div');
+      if (fill) fill.style.width = Math.round(fraction * 100) + '%';
     }}
 
-    function handleFiles(files) {{
-      for (const f of files) uploadOne(f);
+    // Stream the file body to /send-file via XHR so we can hook the
+    // upload progress event — `fetch` doesn't expose upload progress
+    // for ReadableStream bodies in any current browser. Wrap as a
+    // promise so the per-file loop can await one upload finishing
+    // before starting the next (serializing keeps each row's
+    // progress bar meaningful and prevents the bandwidth split
+    // between multiple concurrent uploads).
+    function uploadOne(file) {{
+      return new Promise(resolve => {{
+        const row = addLogRow(file);
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', '/send-file', true);
+        xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
+        xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+        xhr.upload.onprogress = e => {{
+          if (e.lengthComputable) setRowProgress(row, e.loaded / e.total);
+        }};
+        xhr.onload = () => {{
+          let json;
+          try {{ json = JSON.parse(xhr.responseText); }}
+          catch (_) {{ json = {{ok:false,reason:'bad response'}}; }}
+          setRowStatus(row, json.ok === true, json.reason || ('HTTP ' + xhr.status));
+          resolve();
+        }};
+        xhr.onerror = () => {{
+          setRowStatus(row, false, 'network error');
+          resolve();
+        }};
+        xhr.send(file);
+      }});
+    }}
+
+    async function handleFiles(files) {{
+      // Serialize uploads — the PC server's rate-limit means
+      // concurrent uploads would just queue up server-side and
+      // produce confusing UI where every progress bar moves at
+      // 1/Nth speed. Sequential is more predictable for the user.
+      for (const f of files) {{
+        await uploadOne(f);
+      }}
     }}
 
     drop.addEventListener('dragover', e => {{

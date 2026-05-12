@@ -994,22 +994,23 @@ async fn handle_file_chunk(
 
 /// Spawn the streamer task for one PC → phone file send. Reads
 /// `temp_path` in 256 KiB chunks, wraps each in a FILE Binary frame
-/// with `transfer_id=id`, and pushes onto `outbox`. The last chunk has
-/// the LAST_CHUNK flag set. The task watches `cancel` between chunks
-/// and bails out (without LAST_CHUNK) if it ever flips to `true`, so a
-/// peer disconnect or phone-reported failure immediately stops the
-/// stream.
+/// with `transfer_id=id`, and pushes onto `outbox_bulk`. The last
+/// chunk has the LAST_CHUNK flag set. The task watches `cancel`
+/// between chunks and bails out (without LAST_CHUNK) if it ever flips
+/// to `true`, so a peer disconnect or phone-reported failure
+/// immediately stops the stream.
 ///
-/// ## Why a yield between chunks
-/// `OutboundTx` is `UnboundedSender`, so pushing chunks doesn't block
-/// regardless of how fast the downstream WS writer drains. A naive
-/// `read → send → loop` would queue the entire file in memory at disk
-/// speed (hundreds of MB/s) before the network has caught up. The
-/// `yield_now` plus the periodic short sleep give the WS writer a real
-/// chance to run between bursts so the outbound queue tops out at a
-/// few MiB rather than the full file size. Not perfect back-pressure
-/// — the right fix is a bounded outbox — but good enough for v1 file
-/// sizes (hundreds of MiB), and harmless on fast links.
+/// ## Rate limiting
+/// Each iteration measures elapsed wall time and sleeps to reach a
+/// target chunk-interval (currently 640 ms ≈ 400 KiB/s = 3.2 Mbps).
+/// The downstream pipeline has multiple unbounded byte buffers
+/// (tungstenite's write buffer, kernel TCP send buffer, relay's
+/// TCP recv buffer, …) so even with a bounded `outbox_bulk` the
+/// streamer otherwise pumps the whole file into the wire-side
+/// queues in milliseconds, holding the phone-bound pipe occupied
+/// for as long as it takes to actually transmit — and every video
+/// frame produced during that window waits behind file bytes. The
+/// hard cap here trades raw file throughput for sane video latency.
 fn spawn_file_sender(
     id: u32,
     name: String,

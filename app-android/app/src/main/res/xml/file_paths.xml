@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FileProvider mappings for sharing app-private external storage with
+  other apps (e.g. system viewers, the Files app, gallery) via
+  content:// URIs. M6 v2's PC→phone file send drops files into
+  `external-files-path/Downloads/`, so the receive list dialog can
+  hand off to ACTION_VIEW with a content URI rooted there.
+
+  `external-files-path` maps to `Context.getExternalFilesDir(null)` —
+  i.e. `/storage/emulated/0/Android/data/<pkg>/files/`. Scoped storage
+  on Android 10+ keeps this readable to the owning app without a
+  runtime permission, but other apps can only reach into it via a
+  FileProvider grant such as this one.
+-->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <external-files-path name="downloads" path="Downloads/" />
+</paths>

@@ -29,6 +29,22 @@
             </intent-filter>
         </activity>
 
+        <!-- FileProvider used by the M6 v2 "received files" UI to hand
+             content:// URIs to system viewers (gallery, video player,
+             generic ACTION_VIEW). Without it, app-private external
+             storage (Android/data/<pkg>/files/) is unreadable to any
+             other app. Authority is `<pkg>.fileprovider`; see
+             `res/xml/file_paths.xml` for the path whitelist. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
     </application>
 
 </manifest>

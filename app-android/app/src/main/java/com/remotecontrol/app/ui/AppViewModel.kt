@@ -31,7 +31,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     // system file manager but doesn't need a runtime storage permission
     // (scoped storage takes care of it for our own files). Created the
     // first time the ConnectionClient lands a file there.
-    private val downloadsDir: java.io.File =
+    //
+    // Public so the "received files" dialog in MainScreen can enumerate
+    // its contents and hand them off to ACTION_VIEW via FileProvider.
+    val downloadsDir: java.io.File =
         java.io.File(app.getExternalFilesDir(null), "Downloads")
 
     private val client = ConnectionClient(downloadsDir = downloadsDir)
