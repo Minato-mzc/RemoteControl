@@ -9,6 +9,7 @@ pub mod config;
 pub mod connection;
 pub mod encoder;
 pub mod file_send;
+pub mod tray;
 #[cfg(windows)]
 pub mod input;
 pub mod net;
@@ -48,12 +49,19 @@ pub enum ServerMode {
 }
 
 /// Boot the full server. The exact transports started depend on `mode`.
-pub async fn run_server(mode: ServerMode) -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+///
+/// `pairing` is created by `main.rs` and shared with the tray event
+/// loop (so the "refresh QR" menu item can rotate it directly).
+/// `tray_state` is `None` only on test paths that don't bring up the
+/// tray; production always passes `Some`.
+pub async fn run_server(
+    mode: ServerMode,
+    pairing: Arc<pairing::PairingStore>,
+    tray_state: Option<Arc<tray::TrayState>>,
+) -> Result<()> {
+    // Tracing init is now done in `main.rs` before the tray thread
+    // starts, so log output captures both server and tray events
+    // from process start. Calling it twice would panic — skip here.
 
     let cfg = config::Config::load_or_default()?;
     let port = cfg.port;
@@ -76,9 +84,10 @@ pub async fn run_server(mode: ServerMode) -> Result<()> {
         );
     }
 
-    // Pairing code is shared across both transports — the phone can
-    // scan the LAN QR or the relay QR with the same code.
-    let pairing = Arc::new(pairing::PairingStore::new_with_fresh_code());
+    // `pairing` is now created by main.rs so the tray loop can hold a
+    // clone of it for the "refresh QR" menu action. The fresh code on
+    // process start is still produced via `PairingStore::new_with_fresh_code`
+    // in main; this function just consumes it.
     let (code, key_b64) = pairing.current_qr_fields();
 
     // Load or warn about the persistent trust store. Same fallback path
@@ -135,13 +144,14 @@ pub async fn run_server(mode: ServerMode) -> Result<()> {
     );
     let qr_http_port = port.saturating_add(1);
     if render_html {
-        // Suppress the unused-warning when both `code` and `key_b64` are
-        // not needed here anymore (the QR HTTP server reads fresh values
-        // from `pairing` on each request).
+        // Suppress the unused-warning when both `code` and `key_b64`
+        // are not needed here anymore (the QR HTTP server reads fresh
+        // values from `pairing` on each request).
         let _ = (&code, &key_b64);
-        let qr_url = format!("http://127.0.0.1:{qr_http_port}/");
-        open_in_default_browser(&qr_url);
-        info!("QR page: {qr_url} (will open in your browser shortly)");
+        info!(
+            "QR page available at http://127.0.0.1:{qr_http_port}/ \
+             (tray opens an embedded WebView on first launch)"
+        );
     }
     if let Some(rcfg) = &relay_cfg {
         let authority = rcfg
@@ -170,6 +180,10 @@ pub async fn run_server(mode: ServerMode) -> Result<()> {
     // the staleness-safe register/deregister handshake.
     let file_send_bridge = file_send::FileSendBridge::new();
 
+    // Tray-state peer counter, cloned out of `tray_state` so both
+    // transports can update it without holding the rest of the state.
+    let peer_count_clone = tray_state.as_ref().map(|s| s.peer_count.clone());
+
     // Spawn whichever transports the mode requests. We `join!` them so
     // a failure in one tears the other down (rather than leaving the
     // user with a half-running server they think is working).
@@ -182,6 +196,7 @@ pub async fn run_server(mode: ServerMode) -> Result<()> {
                 trusted.clone(),
                 cfg.clone(),
                 file_send_bridge.clone(),
+                peer_count_clone.clone(),
             )
             .await
         } else {
@@ -210,6 +225,7 @@ pub async fn run_server(mode: ServerMode) -> Result<()> {
                     trusted.clone(),
                     cfg.clone(),
                     file_send_bridge.clone(),
+                    peer_count_clone.clone(),
                 )
                 .await
             {

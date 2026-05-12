@@ -28,6 +28,7 @@ pub async fn run(
     trusted: Arc<TrustedDevicesStore>,
     cfg: Arc<Config>,
     file_send_bridge: Arc<crate::file_send::FileSendBridge>,
+    peer_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
 ) -> Result<()> {
     let bind = format!("0.0.0.0:{port}");
     let listener = TcpListener::bind(&bind).await?;
@@ -39,9 +40,20 @@ pub async fn run(
         let trusted = trusted.clone();
         let cfg = cfg.clone();
         let bridge = file_send_bridge.clone();
+        let counter = peer_count.clone();
         tokio::spawn(async move {
+            // Bump the live-connection counter for the lifetime of this
+            // task — read by the tray loop to drive its tooltip.
+            // Counts accepted-but-not-yet-authenticated peers too,
+            // which is fine for the UI (rare and short-lived).
+            if let Some(c) = counter.as_ref() {
+                c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             if let Err(e) = bridge_lan_peer(tcp, peer, pairing, trusted, cfg, bridge).await {
                 warn!("connection from {peer} ended: {e:#}");
+            }
+            if let Some(c) = counter.as_ref() {
+                c.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
         });
     }

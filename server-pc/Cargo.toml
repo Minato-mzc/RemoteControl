@@ -66,6 +66,17 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 
+# System tray icon (M9-ish polish): runs alongside the console window so
+# the user can keep the server up without staring at a terminal. tao
+# gives us a cross-platform event loop that pumps Win32 messages
+# (required for tray-icon to receive menu clicks).
+tray-icon = "0.19"
+tao = "0.30"
+# Embedded WebView for the in-app QR page so the user doesn't have to
+# leave the app to scan or drop files. Uses WebView2 on Windows
+# (pre-installed on Win11, present via Edge on most Win10 setups).
+wry = "0.45"
+
 # Windows-only: DXGI Desktop Duplication for capture, Media Foundation for H.264 encode.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

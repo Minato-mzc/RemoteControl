@@ -283,6 +283,7 @@ impl RelayClient {
         trusted: Arc<TrustedDevicesStore>,
         cfg: Arc<Config>,
         file_send_bridge: Arc<crate::file_send::FileSendBridge>,
+        peer_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
     ) -> Result<()> {
         // Translate http(s) base URL into ws(s) for the long-lived WS.
         // We accept either form so the user's relay.toml can store
@@ -348,6 +349,7 @@ impl RelayClient {
         let reader_sessions = sessions.clone();
         let reader_out_tx = host_out_tx.clone();
         let reader_bridge = file_send_bridge.clone();
+        let reader_counter = peer_count.clone();
 
         let reader = tokio::spawn(async move {
             while let Some(item) = ws_stream.next().await {
@@ -397,7 +399,11 @@ impl RelayClient {
                         let logic_trusted = reader_trusted.clone();
                         let logic_cfg = reader_cfg.clone();
                         let logic_bridge = reader_bridge.clone();
+                        let logic_counter = reader_counter.clone();
                         tokio::spawn(async move {
+                            if let Some(c) = logic_counter.as_ref() {
+                                c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                             if let Err(e) = run_connection(
                                 label,
                                 inbox_rx,
@@ -412,6 +418,9 @@ impl RelayClient {
                             .await
                             {
                                 warn!("tunnel session ended: {e:#}");
+                            }
+                            if let Some(c) = logic_counter.as_ref() {
+                                c.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                             }
                         });
 
