@@ -282,6 +282,7 @@ impl RelayClient {
         pairing: Arc<PairingStore>,
         trusted: Arc<TrustedDevicesStore>,
         cfg: Arc<Config>,
+        file_send_bridge: Arc<crate::file_send::FileSendBridge>,
     ) -> Result<()> {
         // Translate http(s) base URL into ws(s) for the long-lived WS.
         // We accept either form so the user's relay.toml can store
@@ -346,6 +347,7 @@ impl RelayClient {
         let reader_cfg = cfg.clone();
         let reader_sessions = sessions.clone();
         let reader_out_tx = host_out_tx.clone();
+        let reader_bridge = file_send_bridge.clone();
 
         let reader = tokio::spawn(async move {
             while let Some(item) = ws_stream.next().await {
@@ -370,6 +372,20 @@ impl RelayClient {
                             mpsc::unbounded_channel::<Message>();
                         let (outbox_tx, mut outbox_rx) =
                             mpsc::unbounded_channel::<Message>();
+                        // Bounded video channel — drop-on-full so a
+                        // slow downstream can't grow a backlog of
+                        // stale video frames. See connection.rs for
+                        // the full rationale.
+                        let (outbox_video_tx, mut outbox_video_rx) =
+                            mpsc::channel::<Message>(
+                                crate::connection::OUTBOUND_VIDEO_CAP,
+                            );
+                        // Bounded bulk channel (blocking on full) so
+                        // file sends back-pressure the streamer.
+                        let (outbox_bulk_tx, mut outbox_bulk_rx) =
+                            mpsc::channel::<Message>(
+                                crate::connection::OUTBOUND_BULK_CAP,
+                            );
                         reader_sessions.lock().await.insert(
                             client_id.clone(),
                             PhoneSession { inbox_tx },
@@ -380,14 +396,18 @@ impl RelayClient {
                         let logic_pairing = reader_pairing.clone();
                         let logic_trusted = reader_trusted.clone();
                         let logic_cfg = reader_cfg.clone();
+                        let logic_bridge = reader_bridge.clone();
                         tokio::spawn(async move {
                             if let Err(e) = run_connection(
                                 label,
                                 inbox_rx,
                                 outbox_tx,
+                                outbox_video_tx,
+                                outbox_bulk_tx,
                                 logic_pairing,
                                 logic_trusted,
                                 logic_cfg,
+                                logic_bridge,
                             )
                             .await
                             {
@@ -395,24 +415,53 @@ impl RelayClient {
                             }
                         });
 
-                        // Outbound pump: this session's `OutboundTx` drains
-                        // here and we wrap into a TunnelFrame::Data targeted
-                        // at the same client_id, sending to the host writer.
+                        // Outbound pump: this session's `OutboundTx`/
+                        // `OutboundBulkTx` drain here. We wrap each
+                        // Message into a `TunnelFrame::Data` aimed at
+                        // `client_id` and forward to the host writer.
+                        // Biased select on `outbox_rx` (fast) first so
+                        // a backed-up file send can't delay control or
+                        // video traffic.
                         let writer_out_tx = reader_out_tx.clone();
                         let writer_sessions = reader_sessions.clone();
                         let writer_cid = client_id.clone();
                         tokio::spawn(async move {
-                            while let Some(m) = outbox_rx.recv().await {
+                            // Result of pulling one Message off either
+                            // queue and turning it into a tunnel frame.
+                            // `Skip` lets us silently drop unsupported
+                            // variants without breaking the loop.
+                            enum Pumped { Frame(TunnelFrame), Skip, Stop }
+                            let pump_one = |m: Message| -> Pumped {
                                 let (text, bytes) = match m {
                                     Message::Text(s) => (true, s.as_bytes().to_vec()),
                                     Message::Binary(b) => (false, b.to_vec()),
-                                    Message::Close(_) => break,
-                                    _ => continue,
+                                    Message::Close(_) => return Pumped::Stop,
+                                    _ => return Pumped::Skip,
                                 };
-                                let frame = TunnelFrame::Data {
+                                Pumped::Frame(TunnelFrame::Data {
                                     client_id: writer_cid.clone(),
                                     text,
                                     payload: bytes,
+                                })
+                            };
+                            loop {
+                                let pumped = tokio::select! {
+                                    biased;
+                                    m = outbox_rx.recv() => {
+                                        match m { Some(m) => pump_one(m), None => break }
+                                    }
+                                    m = outbox_video_rx.recv() => {
+                                        match m { Some(m) => pump_one(m), None => break }
+                                    }
+                                    m = outbox_bulk_rx.recv() => {
+                                        match m { Some(m) => pump_one(m), None => break }
+                                    }
+                                    else => break,
+                                };
+                                let frame = match pumped {
+                                    Pumped::Frame(f) => f,
+                                    Pumped::Skip => continue,
+                                    Pumped::Stop => break,
                                 };
                                 if writer_out_tx.send(frame).is_err() {
                                     break;

@@ -27,6 +27,7 @@ pub async fn run(
     pairing: Arc<PairingStore>,
     trusted: Arc<TrustedDevicesStore>,
     cfg: Arc<Config>,
+    file_send_bridge: Arc<crate::file_send::FileSendBridge>,
 ) -> Result<()> {
     let bind = format!("0.0.0.0:{port}");
     let listener = TcpListener::bind(&bind).await?;
@@ -37,8 +38,9 @@ pub async fn run(
         let pairing = pairing.clone();
         let trusted = trusted.clone();
         let cfg = cfg.clone();
+        let bridge = file_send_bridge.clone();
         tokio::spawn(async move {
-            if let Err(e) = bridge_lan_peer(tcp, peer, pairing, trusted, cfg).await {
+            if let Err(e) = bridge_lan_peer(tcp, peer, pairing, trusted, cfg, bridge).await {
                 warn!("connection from {peer} ended: {e:#}");
             }
         });
@@ -56,6 +58,7 @@ async fn bridge_lan_peer(
     pairing: Arc<PairingStore>,
     trusted: Arc<TrustedDevicesStore>,
     cfg: Arc<Config>,
+    file_send_bridge: Arc<crate::file_send::FileSendBridge>,
 ) -> Result<()> {
     let ws = accept_async(tcp).await?;
     let (mut sink, mut stream) = ws.split();
@@ -73,6 +76,13 @@ async fn bridge_lan_peer(
         OutboundTx,
         mpsc::UnboundedReceiver<Message>,
     ) = mpsc::unbounded_channel();
+    // Bounded video channel (drop-on-full). See
+    // `connection::OutboundVideoTx` for the rationale.
+    let (outbox_video_tx, mut outbox_video_rx) =
+        mpsc::channel::<Message>(crate::connection::OUTBOUND_VIDEO_CAP);
+    // Bounded bulk channel (blocks on full) for FILE sends.
+    let (outbox_bulk_tx, mut outbox_bulk_rx) =
+        mpsc::channel::<Message>(crate::connection::OUTBOUND_BULK_CAP);
 
     let peer_label = peer.to_string();
 
@@ -99,10 +109,40 @@ async fn bridge_lan_peer(
             }
         })
     };
+    // Writer multiplexes three outbound queues with biased priority:
+    //   1. `outbox_rx` (control plane JSON, unbounded) — must deliver
+    //      and never delayed.
+    //   2. `outbox_video_rx` (VIDEO/AUDIO binary, bounded 2 drop-on-
+    //      full) — fresh frames take precedence over bulk.
+    //   3. `outbox_bulk_rx` (FILE binary, bounded 8 blocking) — bulk
+    //      progresses whenever the higher tiers are idle.
+    //
+    // `biased;` polls in declaration order so a long-running file
+    // send can never freeze the screen — every time a fresh video
+    // frame lands the writer dispatches it before resuming bulk.
     let writer = tokio::spawn(async move {
-        while let Some(m) = outbox_rx.recv().await {
-            if sink.send(m).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                biased;
+                msg = outbox_rx.recv() => {
+                    let Some(m) = msg else { break };
+                    if sink.send(m).await.is_err() {
+                        break;
+                    }
+                }
+                msg = outbox_video_rx.recv() => {
+                    let Some(m) = msg else { break };
+                    if sink.send(m).await.is_err() {
+                        break;
+                    }
+                }
+                msg = outbox_bulk_rx.recv() => {
+                    let Some(m) = msg else { break };
+                    if sink.send(m).await.is_err() {
+                        break;
+                    }
+                }
+                else => break,
             }
         }
         let _ = sink.close().await;
@@ -112,9 +152,12 @@ async fn bridge_lan_peer(
         peer_label,
         inbox_rx,
         outbox_tx,
+        outbox_video_tx,
+        outbox_bulk_tx,
         pairing,
         trusted,
         cfg,
+        file_send_bridge,
     )
     .await;
 

@@ -104,10 +104,12 @@ class MainActivity : ComponentActivity() {
                             val msg = when (event) {
                                 is FileTransferEvent.Accepted ->
                                     "PC 已接收，开始上传…"
+                                is FileTransferEvent.Incoming ->
+                                    "电脑发来文件：${event.name}"
                                 is FileTransferEvent.Complete ->
-                                    "上传完成：${event.destPath}"
+                                    "传输完成：${event.destPath}"
                                 is FileTransferEvent.Failed ->
-                                    "上传失败：${event.reason}"
+                                    "传输失败：${event.reason}"
                                 is FileTransferEvent.Progress -> null
                             }
                             if (msg != null) {

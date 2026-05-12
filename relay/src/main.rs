@@ -252,30 +252,36 @@ struct OnlineHost {
     /// phone's TCP, which trips the phone-side `waitForBufferRoom` throttle
     /// — i.e. one phone slows itself down without affecting peers.
     to_host: mpsc::Sender<TunnelFrame>,
-    /// Per-client outbound queues. The host's reader pushes into the
-    /// matching entry when it receives a `TunnelFrame::Data` aimed at
-    /// `client_id`; the client_loop pumps that queue onto the phone's
-    /// WS. Wrapped in a Mutex because the host loop and individual
-    /// client loops both need to mutate the map (open/close on either
-    /// side).
+    /// Per-client outbound queues. Two channels per phone:
+    ///   * `fast` — VIDEO / AUDIO frames. Droppable at insertion (a
+    ///     stale frame helps no one; phone's decoder will recover
+    ///     within one keyframe).
+    ///   * `bulk` — text (helloOk, authOk, …) and FILE chunks. Must
+    ///     deliver in order; insertion blocks the host_loop reader
+    ///     until there's room.
     ///
-    /// Bounded — capacity [`PER_CLIENT_QUEUE_CAP`]. When the phone's WS
-    /// is congested (slow 4G, momentary radio dip, etc.) the writer's
-    /// `sink.send` stalls and queue depth grows; if we let it grow
-    /// unbounded, by the time the link recovers we'd be replaying many
-    /// seconds of stale video. Instead, the host_loop reader drops
-    /// surplus *Binary* frames at insertion time (P-frames will glitch
-    /// until next IDR every ~5s — fine for desktop control). Text
-    /// frames carry control-plane messages (helloOk, authOk, frame
-    /// stats) and are pushed with a blocking `send().await` so they
-    /// never get dropped.
-    clients: Arc<Mutex<HashMap<String, mpsc::Sender<PhoneOut>>>>,
+    /// Splitting them in two prevents the failure we hit in production:
+    /// a multi-MiB PC→phone file send filled the per-client queue with
+    /// must-deliver FILE chunks, and every subsequent VIDEO frame got
+    /// dropped on `try_send` — i.e. the user got a frozen screen on
+    /// the phone while a file was downloading. With separate queues,
+    /// the writer can keep emitting fresh VIDEO frames even while the
+    /// FILE pipeline is back-pressured against the phone's downlink.
+    clients: Arc<Mutex<HashMap<String, ClientChannels>>>,
     /// Notified by a *new* host_loop when it displaces this entry.
     /// The old reader selects on this in addition to its WS stream so
     /// we don't have to wait for TCP keepalive (default 2hr on Linux)
     /// to surface a dead peer — the new connection is the authoritative
     /// signal that the old one is stale.
     cancel: Arc<Notify>,
+}
+
+/// The two per-client senders the host_loop reader picks between based
+/// on the WS frame type carried in `payload[0]`.
+#[derive(Clone)]
+struct ClientChannels {
+    fast: mpsc::Sender<PhoneOut>,
+    bulk: mpsc::Sender<PhoneOut>,
 }
 
 /// One message destined for a phone's WS.
@@ -285,12 +291,29 @@ struct PhoneOut {
     text: bool,
 }
 
-/// Per-phone outbound queue capacity. At ~30 fps and a 5 s GOP this is
-/// roughly 2 s of buffered video — enough to ride out a brief radio dip,
-/// small enough that the phone never receives content that's already
-/// stale. Past this many frames, the host_loop reader drops new Binary
-/// frames at insertion time rather than queueing forever.
-const PER_CLIENT_QUEUE_CAP: usize = 64;
+/// Per-phone "fast" queue capacity (VIDEO / AUDIO — droppable). At
+/// 30 fps that's ~270 ms of buffered video. Sized deliberately small
+/// to bound the **stale-frame latency** seen after a bulk send pause:
+/// every `sink.send(FILE_chunk)` on the bulk arm commits the writer
+/// for the chunk's transmission time (200 ms – 1 s on real links).
+/// While that's in flight, new video frames pile up in `fast`. With
+/// a 64-frame cap (the original tuning) the user would see ~2 s of
+/// catch-up playback after each chunk; at 8 it's a quarter second,
+/// which reads as a brief blur instead of "video is 2 s behind."
+///
+/// The cost is dropping more frames during sustained bulk transfers,
+/// but with our 1 s keyframe interval any drop is recovered inside a
+/// second — not noticeable for typical screen-share content.
+const PER_CLIENT_FAST_CAP: usize = 8;
+
+/// Per-phone "bulk" queue capacity (text control plane + FILE chunks
+/// — must-deliver, blocking send). 32 × 256 KiB = 8 MiB max in flight,
+/// which the host_loop reader uses to apply back-pressure all the way
+/// to the PC sender when the phone's downlink can't keep up. Sized to
+/// match `TO_HOST_QUEUE_CAP` for symmetry — beyond this, the host
+/// reader blocks in `.send().await`, which propagates upstream so the
+/// PC's outbound queue doesn't accumulate gigabytes either.
+const PER_CLIENT_BULK_CAP: usize = 32;
 
 /// Shared phone→PC queue capacity. All phone sessions on a given host
 /// share this one channel (the host has a single inbound WS, so we have
@@ -508,10 +531,7 @@ async fn host_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
     let (mut sink, mut stream) = ws.split();
     let (to_host_tx, mut to_host_rx) =
         mpsc::channel::<TunnelFrame>(TO_HOST_QUEUE_CAP);
-    let clients = Arc::new(Mutex::new(HashMap::<
-        String,
-        mpsc::Sender<PhoneOut>,
-    >::new()));
+    let clients = Arc::new(Mutex::new(HashMap::<String, ClientChannels>::new()));
 
     let my_instance = state.next_instance.fetch_add(1, Ordering::Relaxed);
     let cancel = Arc::new(Notify::new());
@@ -621,39 +641,60 @@ async fn host_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
                         text,
                         payload,
                     } => {
-                        // Snapshot the sender out of the map so we don't
-                        // hold the mutex across the .await below — that'd
+                        // Snapshot the channels out of the map so we
+                        // don't hold the mutex across `.await` — that'd
                         // serialize all client routing through one lock.
-                        let sender = {
+                        let chans = {
                             let map = clients.lock().await;
                             map.get(&client_id).cloned()
                         };
-                        if let Some(sender) = sender {
+                        if let Some(chans) = chans {
+                            // Look at the protocol-level frame_type byte
+                            // (offset 0 of the payload, see PROTOCOL.md
+                            // §"数据平面") so we can pick the right
+                            // delivery policy. Values must stay in sync
+                            // with `server-pc/src/protocol.rs::frame_type`
+                            // and `app-android/.../Protocol.kt::FrameType`.
+                            //   0x01 VIDEO — droppable (decoder recovers
+                            //                at next IDR, ~1 s).
+                            //   0x02 AUDIO — droppable (lost samples are
+                            //                preferable to lagged audio).
+                            //   0x03 FILE  — MUST NOT drop; loss corrupts
+                            //                the receiver's reassembled
+                            //                output.
+                            //
+                            // The bulk queue (text + FILE) and the fast
+                            // queue (VIDEO/AUDIO) are independent, so
+                            // even a long-running file send doesn't
+                            // crowd VIDEO frames out — the writer task
+                            // selects from both and prefers fast, so
+                            // the phone keeps getting fresh frames
+                            // through the entire transfer.
+                            const FRAME_TYPE_FILE: u8 = 0x03;
+                            let frame_type =
+                                payload.first().copied().unwrap_or(0);
+                            let must_deliver =
+                                text || frame_type == FRAME_TYPE_FILE;
                             let out = PhoneOut { bytes: payload, text };
-                            if text {
-                                // Control-plane (helloOk, authOk, codec
-                                // params, etc.). Must not be dropped — wait
-                                // for queue room. In practice this only
-                                // blocks if the link is hosed enough that
-                                // we're going to disconnect anyway.
-                                let _ = sender.send(out).await;
+                            if must_deliver {
+                                // Control-plane JSON or FILE chunks →
+                                // bulk channel. Blocking send applies
+                                // back-pressure to the host writer if
+                                // the phone's downlink is the bottleneck.
+                                let _ = chans.bulk.send(out).await;
                             } else {
-                                // Video / audio frame. Drop on full queue —
-                                // a stale frame helps no one. Phone's
-                                // decoder will glitch until next IDR (≤5s)
-                                // and recover, which is far better than
-                                // playing back many seconds of video that
-                                // arrived after the user already moved on.
-                                if sender.try_send(out).is_err() {
-                                    // Could be QueueFull or QueueClosed.
-                                    // Closed = client_loop already exited;
-                                    // map cleanup will catch it shortly.
-                                    // Full = backpressure; drop is the
-                                    // intended behavior. Either way, no
-                                    // log per drop (would flood under load)
-                                    // — host_loop has no good way to
-                                    // distinguish here without leaking
-                                    // tokio::sync::mpsc error variants.
+                                // Video / audio frame → fast channel.
+                                // Drop on full: a stale A/V frame helps
+                                // no one. Phone's decoder glitches
+                                // until the next IDR and recovers,
+                                // which is far better than playing back
+                                // many seconds of content that arrived
+                                // after the user already moved on.
+                                if chans.fast.try_send(out).is_err() {
+                                    // QueueFull or QueueClosed; neither
+                                    // is worth a per-frame log (would
+                                    // flood under load). Map cleanup
+                                    // handles the Closed case.
                                 }
                             }
                         }
@@ -715,7 +756,11 @@ async fn client_ws(
 async fn client_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
     let client_id = uuid::Uuid::new_v4().to_string();
     let (mut sink, mut stream) = ws.split();
-    let (out_tx, mut out_rx) = mpsc::channel::<PhoneOut>(PER_CLIENT_QUEUE_CAP);
+    // Two queues per client; see `ClientChannels` for the policy split.
+    let (fast_tx, mut fast_rx) =
+        mpsc::channel::<PhoneOut>(PER_CLIENT_FAST_CAP);
+    let (bulk_tx, mut bulk_rx) =
+        mpsc::channel::<PhoneOut>(PER_CLIENT_BULK_CAP);
 
     // Snapshot the host's bookkeeping refs. If the host went offline
     // between accept and now, abort cleanly.
@@ -731,12 +776,15 @@ async fn client_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
         }
     };
 
-    // Register the phone's outbound queue under client_id so the host's
-    // reader can find it.
-    clients
-        .lock()
-        .await
-        .insert(client_id.clone(), out_tx.clone());
+    // Register the phone's outbound queues under client_id so the host's
+    // reader can route into them.
+    clients.lock().await.insert(
+        client_id.clone(),
+        ClientChannels {
+            fast: fast_tx.clone(),
+            bulk: bulk_tx.clone(),
+        },
+    );
 
     if to_host
         .send(TunnelFrame::ClientOpen {
@@ -760,19 +808,21 @@ async fn client_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
     let (pong_tx, mut pong_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
     // Writer: host → phone (and phone-Pong-replies). One task that owns
-    // `sink`, draining either queue.
+    // `sink`, draining three sources:
+    //   1. pong_rx — phone-Ping replies (highest priority, biased first)
+    //   2. fast_rx — VIDEO/AUDIO (next priority — keep the screen alive)
+    //   3. bulk_rx — text control plane + FILE chunks (last; bulk
+    //                transfers shouldn't starve interactive video)
+    //
+    // `biased;` polls arms in declaration order. Combined with the
+    // separate queues, this means a long-running file send pushes
+    // chunks at the same rate as before, but every time a fresh video
+    // frame lands the writer dispatches it first — so the user keeps
+    // seeing the PC's screen during a download.
     let writer_client_id = client_id.clone();
     let writer_host_id = host_id.clone();
     let writer = tokio::spawn(async move {
         loop {
-            // `biased;` makes the pong arm get polled first on each loop
-            // iteration. It doesn't preempt an in-flight `sink.send().await`
-            // (a future, once entered, runs to completion), but it ensures
-            // that whenever we're between sends and a pong is already
-            // queued, that pong goes out before we start the next video
-            // frame. Combined with the 5s timeout on Binary below, this
-            // keeps phone keepalive responsive even when the link is
-            // congested.
             tokio::select! {
                 biased;
                 maybe_pong = pong_rx.recv() => {
@@ -796,47 +846,19 @@ async fn client_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
                     }
                     info!("client {writer_client_id}: pong sent {plen} bytes");
                 }
-                maybe_out = out_rx.recv() => {
+                maybe_out = fast_rx.recv() => {
                     let Some(out) = maybe_out else { break };
-                    let msg = if out.text {
-                        match String::from_utf8(out.bytes) {
-                            Ok(s) => Message::Text(s.into()),
-                            Err(_) => continue,
-                        }
-                    } else {
-                        Message::Binary(out.bytes.into())
-                    };
-                    // Cap any single send at 15s. With the bounded
-                    // PER_CLIENT_QUEUE_CAP queue dropping surplus video
-                    // frames upstream, this timeout is purely a "kernel
-                    // TCP send buffer is wedged" detector — a healthy 4G
-                    // session, even with brief radio dips, finishes any
-                    // single frame send well under 5s. 15s is below the
-                    // phone's 20s OkHttp pong-timeout (so when we DO
-                    // disconnect, the phone sees a clean WS close instead
-                    // of a confusing "didn't receive pong" error), and
-                    // generous enough that ordinary bufferbloat from a
-                    // brief tower handover doesn't kill the session.
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(15),
-                        sink.send(msg),
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            warn!("client {writer_client_id}: send error: {e}");
-                            break;
-                        }
-                        Err(_) => {
-                            warn!(
-                                "client {writer_client_id}: send timed out after 15s \
-                                 (link wedged), disconnecting"
-                            );
-                            break;
-                        }
+                    if !send_to_phone(&mut sink, out, &writer_client_id).await {
+                        break;
                     }
                 }
+                maybe_out = bulk_rx.recv() => {
+                    let Some(out) = maybe_out else { break };
+                    if !send_to_phone(&mut sink, out, &writer_client_id).await {
+                        break;
+                    }
+                }
+                else => break,
             }
         }
         let _ = sink.close().await;
@@ -844,7 +866,6 @@ async fn client_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
             "client writer exited  id={writer_client_id}  host={writer_host_id}"
         );
     });
-
     // Reader: phone → relay → host.
     while let Some(item) = stream.next().await {
         let msg = match item {
@@ -888,9 +909,62 @@ async fn client_loop(state: Arc<RelayState>, host_id: String, ws: WebSocket) {
         })
         .await;
     clients.lock().await.remove(&client_id);
-    drop(out_tx);
+    // Dropping both senders closes both queues, which makes the writer's
+    // `recv` returns flip to `None` and the select-`else => break` arm
+    // fires. That lets `writer.await` actually return.
+    drop(fast_tx);
+    drop(bulk_tx);
     let _ = writer.await;
     info!("client disconnected  id={client_id}  host={host_id}");
+}
+
+/// Send one `PhoneOut` to the phone's WS sink with a 15 s per-frame
+/// timeout. Returns `true` if the send succeeded (caller continues),
+/// `false` if it failed or timed out (caller breaks the writer loop).
+///
+/// Cap rationale: with `PER_CLIENT_FAST_CAP` upstream dropping surplus
+/// VIDEO frames and `PER_CLIENT_BULK_CAP` back-pressuring everything
+/// else, this timeout is purely a "kernel TCP send buffer is wedged"
+/// detector. A healthy 4G session, even with brief radio dips, finishes
+/// any single send well under 5 s. 15 s is below the phone's old 20 s
+/// OkHttp pong-timeout (we'd already bumped phone's `pingInterval` to
+/// 60 s, but staying under any reasonable client-side keepalive means
+/// when we DO tear down, the phone sees a clean WS close instead of a
+/// confusing "didn't receive pong" error). Generous enough that
+/// ordinary bufferbloat from a brief tower handover doesn't kill the
+/// session.
+async fn send_to_phone(
+    sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    out: PhoneOut,
+    writer_client_id: &str,
+) -> bool {
+    let msg = if out.text {
+        match String::from_utf8(out.bytes) {
+            Ok(s) => Message::Text(s.into()),
+            Err(_) => return true, // skip non-utf8 "text" payloads silently
+        }
+    } else {
+        Message::Binary(out.bytes.into())
+    };
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        sink.send(msg),
+    )
+    .await
+    {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            warn!("client {writer_client_id}: send error: {e}");
+            false
+        }
+        Err(_) => {
+            warn!(
+                "client {writer_client_id}: send timed out after 15s \
+                 (link wedged), disconnecting"
+            );
+            false
+        }
+    }
 }
 
 // ============================================================================

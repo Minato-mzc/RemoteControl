@@ -127,6 +127,29 @@ data class FileTransferAbort(
     val reason: String = "",
 ) : ClientMsg
 
+// ---- M6 v2 file transfer (PC → phone). Phone is the receiver. ----
+
+@Serializable
+@SerialName("file_send_accepted")
+data class FileSendAccepted(
+    val id: Int,
+    @SerialName("dest_path") val destPath: String,
+) : ClientMsg
+
+@Serializable
+@SerialName("file_send_complete")
+data class FileSendComplete(
+    val id: Int,
+    @SerialName("dest_path") val destPath: String,
+) : ClientMsg
+
+@Serializable
+@SerialName("file_send_failed")
+data class FileSendFailed(
+    val id: Int,
+    val reason: String,
+) : ClientMsg
+
 /** Win32 VK_* constants we expose in the keyboard overlay. */
 object VKey {
     const val ESCAPE = 0x1B
@@ -286,6 +309,16 @@ data class FileTransferComplete(
 data class FileTransferFailed(
     val id: Int,
     val reason: String,
+) : ServerMsg
+
+// ---- M6 v2 inbound announcement from PC ----
+
+@Serializable
+@SerialName("file_send_begin")
+data class FileSendBegin(
+    val id: Int,
+    val name: String,
+    val size: Long,
 ) : ServerMsg
 
 @Serializable

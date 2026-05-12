@@ -32,10 +32,40 @@ use crate::trusted_devices::{TrustedDevicesStore, VerifyOutcome};
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Outbound channel: anything we send to the peer goes through this.
-/// Closing the receiver (e.g. peer disconnected) makes our `send` error
-/// and we tear down.
+/// Outbound channel for the control plane only — text-typed JSON
+/// messages (handshake replies, stream_started, clipboard, etc.).
+/// Unbounded because these are tiny and rare; losing one breaks the
+/// protocol so we can't use a drop-on-full bounded channel here.
 pub type OutboundTx = mpsc::UnboundedSender<Message>;
+/// Outbound channel for VIDEO / AUDIO frames. Bounded at
+/// [`OUTBOUND_VIDEO_CAP`] with **drop-on-full** semantics (the encoder
+/// pump uses `try_send` and silently drops on `Err`). Without this the
+/// channel was unbounded and, when the WS writer fell behind during a
+/// concurrent file send, video frames piled up. Result: phone played
+/// back a minute-old screen because frames were still arriving in
+/// FIFO order from the buffered queue. With drop-on-full the phone
+/// always sees the freshest frames; brief drops self-heal within one
+/// keyframe interval (~1 s with our GOP).
+pub type OutboundVideoTx = mpsc::Sender<Message>;
+/// Outbound channel for FILE chunks during PC → phone sends. Bounded
+/// at [`OUTBOUND_BULK_CAP`] so the file streamer naturally blocks on
+/// `.send().await` when the WS writer can't keep up; without this the
+/// streamer pushes the entire file into the channel in seconds and
+/// every video frame produced afterwards waits behind it for the WAN
+/// tunnel to drain.
+pub type OutboundBulkTx = mpsc::Sender<Message>;
+/// Capacity of the video outbound queue. 2 frames at 30 fps ≈ 66 ms
+/// — small enough that catch-up after a bulk send is invisible, large
+/// enough that one IDR (typically 3× P-frame size) plus the next P
+/// can both queue while the writer flushes the previous frame onto
+/// the WS sink.
+pub const OUTBOUND_VIDEO_CAP: usize = 2;
+/// Capacity of the bulk outbound queue. 8 × 256 KiB = 2 MiB max
+/// in-flight, which on a 0.5 MiB/s WAN link drains in ~4 s — short
+/// enough that video frames produced after a file send catch up
+/// quickly, deep enough that a momentary stall doesn't immediately
+/// stall the streamer.
+pub const OUTBOUND_BULK_CAP: usize = 8;
 /// Inbound channel: every WebSocket frame (text or binary) the peer sent
 /// us shows up here. Sender side is closed by the transport pump when
 /// the connection drops; we then exit naturally.
@@ -52,9 +82,12 @@ pub async fn run_connection(
     peer_label: String,
     mut inbox: InboundRx,
     outbox: OutboundTx,
+    outbox_video: OutboundVideoTx,
+    outbox_bulk: OutboundBulkTx,
     pairing: Arc<PairingStore>,
     trusted: Arc<TrustedDevicesStore>,
     cfg: Arc<Config>,
+    file_send_bridge: Arc<crate::file_send::FileSendBridge>,
 ) -> Result<()> {
     info!("peer connected: {peer_label}");
 
@@ -66,6 +99,24 @@ pub async fn run_connection(
     // last-chunk, abort, or peer disconnect.
     let mut file_transfers: std::collections::HashMap<u32, FileTransferState> =
         std::collections::HashMap::new();
+    // M6 v2: PC → phone sends in flight from this session. The HTTP
+    // server pushes `FileSendCmd`s into `file_send_rx`; we allocate an
+    // id, send `FileSendBegin` to the phone, spawn a streamer task that
+    // reads the temp file and pushes FILE Binary frames via `outbox`.
+    // Entries cleared on `FileSendComplete`/`FileSendFailed` from the
+    // phone (or unconditionally on peer disconnect — the streamer's
+    // cancel flag also gets flipped so it stops mid-file).
+    let mut file_sends: std::collections::HashMap<u32, FileSendState> =
+        std::collections::HashMap::new();
+    let (file_send_tx, mut file_send_rx) =
+        mpsc::unbounded_channel::<crate::file_send::FileSendCmd>();
+    // Register ourselves only AFTER authentication (an unauthenticated
+    // peer shouldn't be able to receive files), but we still need the
+    // sender ready so the registration is atomic. Stash this for use
+    // after the first successful handshake. See `register_bridge_once`
+    // closure below.
+    let mut next_file_send_id: u32 = 1;
+    let mut bridge_registration: Option<crate::file_send::BridgeRegistration> = None;
 
     // Watchdog: if no inbound message arrives in this window, treat the
     // connection as zombied and tear it down. Healthy phones send a
@@ -147,6 +198,49 @@ pub async fn run_connection(
                                     )
                                     .await;
                                 }
+                                // M6 v2: replies from phone for PC→phone sends.
+                                ClientMsg::FileSendAccepted { id, dest_path } => {
+                                    if let Some(st) = file_sends.get_mut(&id) {
+                                        st.dest_path = Some(dest_path.clone());
+                                        info!(
+                                            "{peer_label}: send {id} accepted by phone → {dest_path}"
+                                        );
+                                    } else {
+                                        warn!(
+                                            "{peer_label}: send_accepted for unknown id {id}"
+                                        );
+                                    }
+                                }
+                                ClientMsg::FileSendComplete { id, dest_path } => {
+                                    if let Some(st) = file_sends.remove(&id) {
+                                        // Streamer task should already have exited
+                                        // (it broke after pushing the LAST_CHUNK).
+                                        // Just clean up the temp spool.
+                                        let _ = tokio::fs::remove_file(&st.temp_path).await;
+                                        info!(
+                                            "{peer_label}: send {id} ({}) complete → {dest_path}",
+                                            st.name
+                                        );
+                                    } else {
+                                        warn!(
+                                            "{peer_label}: send_complete for unknown id {id}"
+                                        );
+                                    }
+                                }
+                                ClientMsg::FileSendFailed { id, reason } => {
+                                    if let Some(st) = file_sends.remove(&id) {
+                                        st.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        let _ = tokio::fs::remove_file(&st.temp_path).await;
+                                        warn!(
+                                            "{peer_label}: send {id} ({}) failed on phone: {reason}",
+                                            st.name
+                                        );
+                                    } else {
+                                        warn!(
+                                            "{peer_label}: send_failed for unknown id {id}"
+                                        );
+                                    }
+                                }
                                 other => {
                                     let cont = handle_client_msg(
                                         other,
@@ -216,10 +310,61 @@ pub async fn run_connection(
                     }
                     continue;
                 };
-                if outbox.send(Message::Binary(bin.into())).is_err() {
-                    break;
+                // Video / audio frames go via the bounded
+                // drop-on-full channel. `try_send` either succeeds
+                // (writer has room) or fails with Full (writer is
+                // behind — drop this frame, the encoder will produce
+                // another in ~33 ms and a fresh keyframe within 1 s).
+                // Closed means the connection is tearing down; we
+                // exit the loop. Full is silent on the success path
+                // because logging every drop would flood under
+                // sustained congestion (the whole point is that we
+                // *expect* drops here).
+                match outbox_video.try_send(Message::Binary(bin.into())) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
+
+            cmd = file_send_rx.recv() => {
+                // `recv` returns None only when the sender side is
+                // dropped, which can't happen while we hold `file_send_tx`
+                // (it's a local of this function). The `else` arm is
+                // unreachable but `let Some(...)` is the idiomatic way
+                // to flatten the Option here.
+                let Some(cmd) = cmd else { continue; };
+                if !authenticated {
+                    // Shouldn't happen — we register the bridge only
+                    // after authentication — but be defensive.
+                    warn!(
+                        "{peer_label}: file_send_cmd arrived pre-auth; dropping"
+                    );
+                    let _ = tokio::fs::remove_file(&cmd.temp_path).await;
+                    continue;
+                }
+                dispatch_file_send_cmd(
+                    cmd,
+                    &peer_label,
+                    &mut next_file_send_id,
+                    &mut file_sends,
+                    &outbox,
+                    &outbox_bulk,
+                ).await;
+            }
+        }
+
+        // Lazy bridge registration: as soon as authentication flips on
+        // the first time, claim the slot so subsequent drag-drops in
+        // the browser route to us. Doing it here keeps an unauthenticated
+        // peer from receiving files even if the slot is empty.
+        if authenticated && bridge_registration.is_none() {
+            let reg = file_send_bridge.register(file_send_tx.clone()).await;
+            info!(
+                "{peer_label}: file-send bridge claimed (instance={})",
+                reg.instance()
+            );
+            bridge_registration = Some(reg);
         }
     }
 
@@ -236,6 +381,21 @@ pub async fn run_connection(
                 state.dest_path.display()
             );
         }
+    }
+    // M6 v2: stop any in-flight PC→phone sends and drop their temp
+    // spools. Streamer tasks check `cancel` on every chunk boundary,
+    // so they exit within one chunk-write of this flag flipping.
+    for (id, state) in file_sends.drain() {
+        state.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Err(e) = tokio::fs::remove_file(&state.temp_path).await {
+            warn!(
+                "{peer_label}: cleanup of pending send {id} ({}) failed: {e}",
+                state.temp_path.display()
+            );
+        }
+    }
+    if let Some(reg) = bridge_registration.take() {
+        file_send_bridge.deregister(reg).await;
     }
     info!("peer disconnected: {peer_label} (authenticated={authenticated})");
     Ok(())
@@ -568,12 +728,16 @@ fn handle_client_msg(
         | ClientMsg::ClipboardSet { .. }
         | ClientMsg::ClipboardGet => {}
 
-        // M6 file transfer messages are handled async upstream in
-        // `run_connection` before this synchronous dispatch is reached.
-        // Listing them here keeps the enum exhaustive.
-        ClientMsg::FileTransferBegin { .. } | ClientMsg::FileTransferAbort { .. } => {
-            // Unreachable in normal flow; if the dispatch ordering ever
-            // changes upstream, fail loudly rather than silently dropping.
+        // M6 (v1 + v2) file-transfer messages are all handled async
+        // upstream in `run_connection` before this synchronous dispatch
+        // is reached. Listing them here keeps the enum exhaustive; we
+        // log loudly if one ever sneaks past the upstream filter so a
+        // refactor that breaks the ordering surfaces immediately.
+        ClientMsg::FileTransferBegin { .. }
+        | ClientMsg::FileTransferAbort { .. }
+        | ClientMsg::FileSendAccepted { .. }
+        | ClientMsg::FileSendComplete { .. }
+        | ClientMsg::FileSendFailed { .. } => {
             warn!(
                 "{peer_label}: file-transfer msg reached sync dispatch (bug)"
             );
@@ -611,6 +775,19 @@ pub struct FileTransferState {
     /// stream) or buggy client; either way we fail the transfer rather
     /// than try to recover.
     pub next_expected_seq: u32,
+}
+
+/// Per-send state for PC → phone file delivery. The streamer task
+/// holds an `Arc<AtomicBool>` whose owner here flips to `true` if the
+/// transfer should abort (peer disconnect, phone-reported failure). The
+/// task notices on its next chunk boundary and exits without pushing
+/// the LAST_CHUNK frame, so the phone's receiver also aborts cleanly.
+pub struct FileSendState {
+    pub name: String,
+    pub temp_path: std::path::PathBuf,
+    pub expected_size: u64,
+    pub dest_path: Option<String>,
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 async fn handle_file_begin(
@@ -813,6 +990,181 @@ async fn handle_file_chunk(
     } else {
         transfers.insert(id, state);
     }
+}
+
+/// Spawn the streamer task for one PC → phone file send. Reads
+/// `temp_path` in 256 KiB chunks, wraps each in a FILE Binary frame
+/// with `transfer_id=id`, and pushes onto `outbox`. The last chunk has
+/// the LAST_CHUNK flag set. The task watches `cancel` between chunks
+/// and bails out (without LAST_CHUNK) if it ever flips to `true`, so a
+/// peer disconnect or phone-reported failure immediately stops the
+/// stream.
+///
+/// ## Why a yield between chunks
+/// `OutboundTx` is `UnboundedSender`, so pushing chunks doesn't block
+/// regardless of how fast the downstream WS writer drains. A naive
+/// `read → send → loop` would queue the entire file in memory at disk
+/// speed (hundreds of MB/s) before the network has caught up. The
+/// `yield_now` plus the periodic short sleep give the WS writer a real
+/// chance to run between bursts so the outbound queue tops out at a
+/// few MiB rather than the full file size. Not perfect back-pressure
+/// — the right fix is a bounded outbox — but good enough for v1 file
+/// sizes (hundreds of MiB), and harmless on fast links.
+fn spawn_file_sender(
+    id: u32,
+    name: String,
+    temp_path: std::path::PathBuf,
+    expected_size: u64,
+    peer_label: String,
+    outbox_bulk: OutboundBulkTx,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+) {
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        // Open lazily inside the task so the HTTP handler can return
+        // 200 to the browser immediately; transient FS hiccups still
+        // surface in logs. If the open fails the phone will eventually
+        // notice (no chunks arrive) and we'll clean up the orphan
+        // FileSendState on peer disconnect.
+        let mut file = match tokio::fs::File::open(&temp_path).await {
+            Ok(f) => f,
+            Err(e) => {
+                warn!("{peer_label}: send {id} open {}: {e}", temp_path.display());
+                return;
+            }
+        };
+        // 256 KiB chunks match the phone→PC direction and keep the
+        // FILE frame payload under the typical WS frame size limit.
+        const CHUNK_BYTES: usize = 256 * 1024;
+        let mut chunk_seq: u32 = 0;
+        let mut sent_bytes: u64 = 0;
+        let mut buf = vec![0u8; CHUNK_BYTES];
+        loop {
+            let chunk_start = std::time::Instant::now();
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                info!(
+                    "{peer_label}: send {id} ({name}) cancelled at {sent_bytes}/{expected_size} bytes"
+                );
+                return;
+            }
+            let n = match file.read(&mut buf).await {
+                Ok(0) => {
+                    warn!(
+                        "{peer_label}: send {id} EOF before declared size ({sent_bytes}/{expected_size})"
+                    );
+                    return;
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    warn!("{peer_label}: send {id} read: {e}");
+                    return;
+                }
+            };
+            sent_bytes += n as u64;
+            let is_last = sent_bytes >= expected_size;
+            let frame = crate::protocol::build_file_chunk_frame(
+                id,
+                chunk_seq,
+                is_last,
+                &buf[..n],
+            );
+            if outbox_bulk
+                .send(Message::Binary(frame.into()))
+                .await
+                .is_err()
+            {
+                // Bulk channel closed → connection tearing down.
+                return;
+            }
+            chunk_seq = chunk_seq.wrapping_add(1);
+            if is_last {
+                info!(
+                    "{peer_label}: send {id} ({name}) streamed all {sent_bytes} bytes (LAST_CHUNK)"
+                );
+                return;
+            }
+            // Hard rate-limit. Bounded `outbox_bulk` *should* apply
+            // back-pressure end-to-end, but in practice the chain of
+            // unbounded buffers downstream (tungstenite's write
+            // buffer, kernel TCP send buffer, network in-flight,
+            // relay's TCP recv buffer, …) easily absorbs the entire
+            // file before the channel ever blocks the streamer. The
+            // file then drains slowly to the phone, holding the
+            // shared phone-bound pipe occupied — every video frame
+            // produced during the drain waits behind file bytes in
+            // those same downstream buffers, surfacing on the phone
+            // as 1+ minute screen latency.
+            //
+            // 400 KiB/s ≈ 3.2 Mbps is a soft cap chosen so the
+            // remaining headroom on a typical 5 Mbps cellular link
+            // (and on slower home upload) is enough for a 1–3 Mbps
+            // video stream. 45 MiB file → ~2 min, acceptable for a
+            // pretty-much-background bulk path. Faster networks pay
+            // a throughput cost; that's the v1 trade-off — the right
+            // long-term fix is congestion-aware throttling (measure
+            // round-trip ACKs and adapt) or a separate WS/QUIC
+            // stream so kernel-level fairness handles the split.
+            const TARGET_CHUNK_INTERVAL_MS: u64 = 640;
+            let elapsed = chunk_start.elapsed();
+            let target =
+                std::time::Duration::from_millis(TARGET_CHUNK_INTERVAL_MS);
+            if elapsed < target {
+                tokio::time::sleep(target - elapsed).await;
+            }
+        }
+    });
+}
+
+/// Resolve a `FileSendCmd` from the bridge into protocol traffic:
+/// allocate an id, persist a `FileSendState`, announce the upload to
+/// the phone, and spawn the streamer. Errors here surface as a 503
+/// equivalent only if the file can't be opened later inside the
+/// streamer — for the metadata path we trust the HTTP server having
+/// already spooled the file.
+async fn dispatch_file_send_cmd(
+    cmd: crate::file_send::FileSendCmd,
+    peer_label: &str,
+    next_id: &mut u32,
+    sends: &mut std::collections::HashMap<u32, FileSendState>,
+    outbox: &OutboundTx,
+    outbox_bulk: &OutboundBulkTx,
+) {
+    let id = *next_id;
+    *next_id = next_id.wrapping_add(1).max(1); // skip 0 just to keep "no transfer" sentinel-able
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    sends.insert(
+        id,
+        FileSendState {
+            name: cmd.name.clone(),
+            temp_path: cmd.temp_path.clone(),
+            expected_size: cmd.size,
+            dest_path: None,
+            cancel: cancel.clone(),
+        },
+    );
+    send(
+        outbox,
+        ServerMsg::FileSendBegin {
+            id,
+            name: cmd.name.clone(),
+            size: cmd.size,
+        },
+    );
+    info!(
+        "{peer_label}: send {id} begin: {} ({} bytes) from {}",
+        cmd.name,
+        cmd.size,
+        cmd.temp_path.display()
+    );
+    spawn_file_sender(
+        id,
+        cmd.name,
+        cmd.temp_path,
+        cmd.size,
+        peer_label.to_string(),
+        outbox_bulk.clone(),
+        cancel,
+    );
 }
 
 /// `%USERPROFILE%\Downloads\RemoteControl` on Windows, `$HOME/Downloads

@@ -258,8 +258,15 @@ private fun UploadCard(u: UploadStatus) {
     val pct = if (u.totalBytes > 0) {
         (u.bytesSent.toFloat() / u.totalBytes.toFloat()).coerceIn(0f, 1f)
     } else 0f
+    // Direction-aware ongoing-state label so an incoming PC → phone
+    // transfer doesn't say "上传中" while it's actually a download.
+    // Terminal badges are direction-neutral (success / failure).
+    val ongoingLabel = when (u.direction) {
+        com.remotecontrol.app.net.TransferDirection.Upload -> "↑ 上传中"
+        com.remotecontrol.app.net.TransferDirection.Download -> "↓ 接收中"
+    }
     val (badge, badgeColor) = when (u.state) {
-        UploadState.Sending -> "上传中" to Color(0xFF1f4d8b)
+        UploadState.Sending -> ongoingLabel to Color(0xFF1f4d8b)
         UploadState.Complete -> "✓ 完成" to Color(0xFF2c7a3e)
         UploadState.Failed -> "✗ 失败" to Color(0xFFB00020)
     }

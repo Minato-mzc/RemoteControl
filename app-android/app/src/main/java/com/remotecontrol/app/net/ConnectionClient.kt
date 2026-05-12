@@ -57,11 +57,23 @@ private const val UPLOAD_BACKPRESSURE_BYTES = 256L * 1024
  *  fault to the user faster than silently waiting forever. */
 private const val UPLOAD_BACKPRESSURE_TIMEOUT_MS = 30_000L
 
-/** Lifecycle events for an in-flight upload. Subscribed by the UI to
- *  render progress and Toasts. */
+/** Direction of a tracked file transfer. Phone-side cards reuse the
+ *  same row UI for both — only the icon and label differ. */
+enum class TransferDirection { Upload, Download }
+
+/** Lifecycle events for an in-flight upload OR an inbound download. The
+ *  outbound (phone → PC) path emits Accepted/Progress/Complete/Failed.
+ *  The inbound (PC → phone) path emits Incoming as the very first event
+ *  (instead of Accepted) and then Progress/Complete/Failed identically. */
 sealed interface FileTransferEvent {
     val id: Int
     data class Accepted(override val id: Int, val destPath: String) : FileTransferEvent
+    data class Incoming(
+        override val id: Int,
+        val name: String,
+        val totalBytes: Long,
+        val destPath: String,
+    ) : FileTransferEvent
     data class Progress(
         override val id: Int,
         val bytesSent: Long,
@@ -78,6 +90,13 @@ sealed interface FileTransferEvent {
  */
 class ConnectionClient(
     private val http: OkHttpClient = defaultClient(),
+    /** Target dir for inbound files (M6 v2). Passed in by the
+     *  ViewModel so this class doesn't have to hold a `Context`. We
+     *  ensure it exists on first save. App-private external storage
+     *  (`context.getExternalFilesDir("Downloads")`) is the typical
+     *  choice — readable by the user via system file managers, but
+     *  doesn't need a runtime storage permission. */
+    private val downloadsDir: java.io.File? = null,
 ) {
     private val _state = MutableStateFlow<ConnectionState>(ConnectionState.Idle)
     val state: StateFlow<ConnectionState> = _state.asStateFlow()
@@ -235,6 +254,7 @@ class ConnectionClient(
         webSocket?.close(1000, "user_disconnect")
         webSocket = null
         _state.value = ConnectionState.Idle
+        abortAllIncomingFiles("disconnected")
     }
 
     /** Ask the server to start a screen stream. Should be called after handshake completes. */
@@ -461,6 +481,182 @@ class ConnectionClient(
 
     private val nextTransferId = java.util.concurrent.atomic.AtomicInteger(1)
 
+    // ---- M6 v2: inbound (PC → phone) file receive state ----
+
+    /** Per-transfer state for an in-flight inbound file. Keyed by the
+     *  transfer id the PC announced in `FileSendBegin`. Cleaned up on
+     *  LAST_CHUNK, abort, or socket teardown. */
+    private data class IncomingFile(
+        val id: Int,
+        val name: String,
+        val totalBytes: Long,
+        val dest: java.io.File,
+        val out: java.io.BufferedOutputStream,
+        var bytesWritten: Long = 0L,
+        var nextSeq: Int = 0,
+    )
+
+    private val incomingFiles =
+        java.util.concurrent.ConcurrentHashMap<Int, IncomingFile>()
+
+    /** Drop every partially-received file on disconnect. Equivalent to
+     *  the PC server's `file_transfers.drain()` cleanup — the user
+     *  shouldn't be left with half-written files cluttering the
+     *  Downloads dir after a flaky connection. */
+    private fun abortAllIncomingFiles(reason: String) {
+        for ((id, st) in incomingFiles) {
+            try {
+                st.out.close()
+            } catch (_: Exception) {
+            }
+            if (st.dest.exists() && st.bytesWritten < st.totalBytes) {
+                st.dest.delete()
+            }
+            _fileEvents.tryEmit(FileTransferEvent.Failed(id, reason))
+        }
+        incomingFiles.clear()
+    }
+
+    /** PC asked us to receive `name`. Allocate a destination file under
+     *  the app-private Downloads dir, open it, and reply with the
+     *  agreed-on path so the PC + UI can show "→ /storage/.../foo.mp4"
+     *  on completion. */
+    private fun handleFileSendBegin(begin: FileSendBegin) {
+        val ws = webSocket
+        if (ws == null) {
+            Log.w(TAG, "file_send_begin with no live ws — ignoring id=${begin.id}")
+            return
+        }
+        val dir = downloadsDir
+        if (dir == null) {
+            Log.w(TAG, "file_send_begin but no downloads dir configured — declining id=${begin.id}")
+            ws.send(ProtoJson.encodeToString(
+                ClientMsg.serializer(),
+                FileSendFailed(id = begin.id, reason = "phone has no downloads dir"),
+            ))
+            return
+        }
+        if (!dir.exists()) dir.mkdirs()
+        val dest = uniqueDestFile(dir, begin.name)
+        val out = try {
+            java.io.BufferedOutputStream(java.io.FileOutputStream(dest))
+        } catch (e: Exception) {
+            Log.w(TAG, "open ${dest.path} for inbound id=${begin.id} failed", e)
+            ws.send(ProtoJson.encodeToString(
+                ClientMsg.serializer(),
+                FileSendFailed(id = begin.id, reason = "open: ${e.message ?: e.javaClass.simpleName}"),
+            ))
+            return
+        }
+        incomingFiles[begin.id] = IncomingFile(
+            id = begin.id,
+            name = begin.name,
+            totalBytes = begin.size,
+            dest = dest,
+            out = out,
+        )
+        ws.send(ProtoJson.encodeToString(
+            ClientMsg.serializer(),
+            FileSendAccepted(id = begin.id, destPath = dest.absolutePath),
+        ))
+        _fileEvents.tryEmit(
+            FileTransferEvent.Incoming(
+                id = begin.id,
+                name = begin.name,
+                totalBytes = begin.size,
+                destPath = dest.absolutePath,
+            )
+        )
+        Log.i(TAG, "incoming file id=${begin.id} ${begin.name} (${begin.size} bytes) → ${dest.path}")
+    }
+
+    /** Dispatch one FILE chunk to the matching `IncomingFile`. Called
+     *  from `onMessage(Binary)` when `FrameType.FILE` is detected. */
+    private fun handleIncomingFileChunk(frame: VideoFrame) {
+        // ptsUs layout for FILE: low 32 bits = transfer_id, high 32 bits = chunk_seq
+        val transferId = (frame.ptsUs and 0xFFFFFFFFL).toInt()
+        val chunkSeq = ((frame.ptsUs ushr 32) and 0xFFFFFFFFL).toInt()
+        // `FrameFlags.LAST_CHUNK` shares bit 0 with `FrameFlags.KEYFRAME`,
+        // so the generic FrameParser surfaces it via `isKeyframe` for
+        // FILE frames. Different semantics, same bit — saves us from
+        // needing a separate parser path.
+        val isLast = frame.isKeyframe
+        val st = incomingFiles[transferId] ?: run {
+            Log.w(TAG, "file chunk for unknown id=$transferId")
+            return
+        }
+        val ws = webSocket
+        if (chunkSeq != st.nextSeq) {
+            Log.w(TAG, "file $transferId out-of-order chunk got=$chunkSeq want=${st.nextSeq}")
+            failIncoming(st, "out-of-order chunk $chunkSeq")
+            return
+        }
+        try {
+            if (frame.payload.isNotEmpty()) {
+                st.out.write(frame.payload)
+                st.bytesWritten += frame.payload.size
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "file $transferId write failed", e)
+            failIncoming(st, "write: ${e.message ?: e.javaClass.simpleName}")
+            return
+        }
+        st.nextSeq++
+        _fileEvents.tryEmit(
+            FileTransferEvent.Progress(transferId, st.bytesWritten, st.totalBytes)
+        )
+        if (isLast) {
+            try {
+                st.out.flush()
+                st.out.close()
+            } catch (e: Exception) {
+                Log.w(TAG, "file $transferId close failed", e)
+                failIncoming(st, "close: ${e.message ?: e.javaClass.simpleName}")
+                return
+            }
+            incomingFiles.remove(transferId)
+            ws?.send(ProtoJson.encodeToString(
+                ClientMsg.serializer(),
+                FileSendComplete(id = transferId, destPath = st.dest.absolutePath),
+            ))
+            _fileEvents.tryEmit(
+                FileTransferEvent.Complete(transferId, st.dest.absolutePath)
+            )
+            Log.i(TAG, "incoming file $transferId complete: ${st.bytesWritten} bytes → ${st.dest.path}")
+        }
+    }
+
+    private fun failIncoming(st: IncomingFile, reason: String) {
+        try { st.out.close() } catch (_: Exception) {}
+        st.dest.delete()
+        incomingFiles.remove(st.id)
+        webSocket?.send(ProtoJson.encodeToString(
+            ClientMsg.serializer(),
+            FileSendFailed(id = st.id, reason = reason),
+        ))
+        _fileEvents.tryEmit(FileTransferEvent.Failed(st.id, reason))
+    }
+
+    /** Pick a path inside `dir` that doesn't already exist. Tries
+     *  `name`, then `name (2)`, `name (3)`, ... up to 999. Past that
+     *  we just append a UUID and call it a day. */
+    private fun uniqueDestFile(dir: java.io.File, name: String): java.io.File {
+        val sanitized = name.replace(Regex("""[\\/:*?"<>|]"""), "_")
+        val candidate = java.io.File(dir, sanitized)
+        if (!candidate.exists()) return candidate
+        val dotIdx = sanitized.lastIndexOf('.')
+        val (base, ext) = if (dotIdx > 0) {
+            sanitized.substring(0, dotIdx) to sanitized.substring(dotIdx)
+        } else {
+            sanitized to ""
+        }
+        for (i in 2..999) {
+            val alt = java.io.File(dir, "$base ($i)$ext")
+            if (!alt.exists()) return alt
+        }
+        return java.io.File(dir, "$base-${java.util.UUID.randomUUID()}$ext")
+    }
+
     /** Block until okhttp's outbound buffer drops below
      *  [UPLOAD_BACKPRESSURE_BYTES], polling every 20 ms. Caps total wait
      *  so we don't get stuck forever on a fully dead connection — past
@@ -565,6 +761,7 @@ class ConnectionClient(
                     Log.w(TAG, "file ${msg.id} failed: ${msg.reason}")
                     _fileEvents.tryEmit(FileTransferEvent.Failed(msg.id, msg.reason))
                 }
+                is FileSendBegin -> handleFileSendBegin(msg)
             }
         }
 
@@ -582,6 +779,7 @@ class ConnectionClient(
                 FrameType.AUDIO -> {
                     _audioFrames.tryEmit(AudioFrame(payload = frame.payload, ptsUs = frame.ptsUs))
                 }
+                FrameType.FILE -> handleIncomingFileChunk(frame)
                 else -> { /* unknown — forward-compat */ }
             }
         }
@@ -605,6 +803,7 @@ class ConnectionClient(
                 Log.i(TAG, "stale onFailure for old ws — ignored")
                 return
             }
+            abortAllIncomingFiles("ws failed: ${t.message ?: "?"}")
             // Combined-QR fallback: if the scanned QR carried both a LAN
             // primary and a relay backup, consume the backup exactly
             // once and retry the dial against it. Typical use: user is
@@ -641,6 +840,7 @@ class ConnectionClient(
             if (_state.value is ConnectionState.Connected) {
                 _state.value = ConnectionState.Idle
             }
+            abortAllIncomingFiles("ws closed: $reason")
         }
     }
 

@@ -118,6 +118,26 @@ pub enum ClientMsg {
         #[serde(default)]
         reason: String,
     },
+
+    // ---- M6 v2: file transfer (PC → phone). Phone is the receiver. ----
+
+    /// Phone confirms it opened a destination file for the incoming
+    /// transfer announced by `FileSendBegin`. PC may now start
+    /// streaming chunks (FILE binary frames carrying the same `id`).
+    /// `dest_path` is whatever the phone chose to display to the user —
+    /// app-private external storage path, MediaStore URI string, etc.
+    #[serde(rename = "file_send_accepted")]
+    FileSendAccepted { id: u32, dest_path: String },
+
+    /// Phone has written the last chunk to disk and finalized the file.
+    /// Returns the same `dest_path` so the PC UI can confirm.
+    #[serde(rename = "file_send_complete")]
+    FileSendComplete { id: u32, dest_path: String },
+
+    /// Phone aborted: out of space, IO error, user declined, transfer
+    /// id unknown, etc. PC reports the reason and forgets this id.
+    #[serde(rename = "file_send_failed")]
+    FileSendFailed { id: u32, reason: String },
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -214,6 +234,21 @@ pub enum ServerMsg {
     /// disconnect, abort, etc. Phone shows the reason to the user.
     #[serde(rename = "file_transfer_failed")]
     FileTransferFailed { id: u32, reason: String },
+
+    // ---- M6 v2: file transfer (PC → phone). Mirrors `FileTransfer*`
+    // but with the directions inverted. PC is the sender. ----
+
+    /// PC announces an incoming file. Phone allocates a destination
+    /// (app-private external storage in v1 so we don't need a runtime
+    /// storage permission), opens the file, and replies with
+    /// `FileSendAccepted`. PC then streams FILE Binary frames carrying
+    /// the same `id`; the last chunk has the `LAST` flag set.
+    #[serde(rename = "file_send_begin")]
+    FileSendBegin {
+        id: u32,
+        name: String,
+        size: u64,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -346,6 +381,27 @@ pub fn peek_frame_header(buf: &[u8]) -> Option<(u8, u8)> {
         return None;
     }
     Some((buf[0], buf[1]))
+}
+
+/// Build a FILE chunk frame for the PC → phone path (M6 v2). Mirror
+/// of `parse_file_chunk`: the 8 PTS bytes carry `transfer_id (u32 LE)
+/// || chunk_seq (u32 LE)`. `last_chunk` sets `frame_flags::LAST_CHUNK`
+/// so the phone knows to finalize the destination file after writing
+/// this payload.
+pub fn build_file_chunk_frame(
+    transfer_id: u32,
+    chunk_seq: u32,
+    last_chunk: bool,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
+    out.push(frame_type::FILE);
+    out.push(if last_chunk { frame_flags::LAST_CHUNK } else { 0 });
+    out.extend_from_slice(&[0u8, 0u8]); // reserved
+    out.extend_from_slice(&transfer_id.to_le_bytes());
+    out.extend_from_slice(&chunk_seq.to_le_bytes());
+    out.extend_from_slice(payload);
+    out
 }
 
 /// Decode a FILE chunk header (the 8 PTS bytes are split into

@@ -27,7 +27,14 @@ import kotlinx.coroutines.launch
 
 class AppViewModel(app: Application) : AndroidViewModel(app) {
 
-    private val client = ConnectionClient()
+    // App-private external-storage Downloads subdir. Visible in the
+    // system file manager but doesn't need a runtime storage permission
+    // (scoped storage takes care of it for our own files). Created the
+    // first time the ConnectionClient lands a file there.
+    private val downloadsDir: java.io.File =
+        java.io.File(app.getExternalFilesDir(null), "Downloads")
+
+    private val client = ConnectionClient(downloadsDir = downloadsDir)
     private val trustedStore = TrustedServerStore(app)
 
     val connectionState: StateFlow<ConnectionState> = client.state
@@ -152,6 +159,22 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // consistent. Lives for the ViewModel's lifetime.
         viewModelScope.launch {
             client.fileEvents.collect { event ->
+                // M6 v2: PC announcing an incoming file. The
+                // ConnectionClient has already opened the destination
+                // file before emitting this; we just seed the UI card.
+                if (event is FileTransferEvent.Incoming) {
+                    _uploads.value = listOf(
+                        UploadStatus(
+                            id = event.id,
+                            name = event.name,
+                            totalBytes = event.totalBytes,
+                            bytesSent = 0L,
+                            state = UploadState.Sending,
+                            direction = com.remotecontrol.app.net.TransferDirection.Download,
+                            destPath = event.destPath,
+                        ),
+                    ) + _uploads.value
+                }
                 _uploads.value = _uploads.value.map { st ->
                     if (st.id != event.id) st else st.applyEvent(event)
                 }
@@ -218,15 +241,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 }
 
 /** UI-facing projection of a single in-flight (or recently finished)
- *  upload. The ViewModel maintains one of these per `transferId` and
+ *  transfer. The ViewModel maintains one of these per `transferId` and
  *  prunes terminal entries a few seconds after they finish so the
- *  user has time to read the result. */
+ *  user has time to read the result. Used for both upload (phone → PC,
+ *  M6 v1) and download (PC → phone, M6 v2); the UI key off `direction`
+ *  to swap icon and direction label. */
 data class UploadStatus(
     val id: Int,
     val name: String,
     val totalBytes: Long,
     val bytesSent: Long,
     val state: UploadState,
+    val direction: com.remotecontrol.app.net.TransferDirection =
+        com.remotecontrol.app.net.TransferDirection.Upload,
     val destPath: String? = null,
     val errorReason: String? = null,
     /** Wall-clock millis when this entry became Complete/Failed, used
@@ -236,6 +263,11 @@ data class UploadStatus(
 ) {
     fun applyEvent(event: FileTransferEvent): UploadStatus = when (event) {
         is FileTransferEvent.Accepted -> copy(destPath = event.destPath)
+        // `Incoming` is only ever the *first* event for a transfer id;
+        // by the time we route into here we've already seeded the entry
+        // (see the AppViewModel init block), so absorbing it as a no-op
+        // is fine. Listed to keep the `when` exhaustive.
+        is FileTransferEvent.Incoming -> this
         is FileTransferEvent.Progress -> copy(
             bytesSent = event.bytesSent,
             // The Begin announced `size` is the authoritative total;

@@ -8,6 +8,7 @@ pub mod clipboard;
 pub mod config;
 pub mod connection;
 pub mod encoder;
+pub mod file_send;
 #[cfg(windows)]
 pub mod input;
 pub mod net;
@@ -161,6 +162,14 @@ pub async fn run_server(mode: ServerMode) -> Result<()> {
         .map(|a| a.addr.to_string())
         .unwrap_or_default();
 
+    // Shared single-slot registry connecting the QR HTTP server (which
+    // accepts drag-and-drop uploads from the browser) to the active
+    // phone session's `run_connection`. Each `run_connection` writes its
+    // command sender into this on entry and clears it on exit; the HTTP
+    // server queries the slot when a file lands. See `file_send` for
+    // the staleness-safe register/deregister handshake.
+    let file_send_bridge = file_send::FileSendBridge::new();
+
     // Spawn whichever transports the mode requests. We `join!` them so
     // a failure in one tears the other down (rather than leaving the
     // user with a half-running server they think is working).
@@ -172,6 +181,7 @@ pub async fn run_server(mode: ServerMode) -> Result<()> {
                 pairing.clone(),
                 trusted.clone(),
                 cfg.clone(),
+                file_send_bridge.clone(),
             )
             .await
         } else {
@@ -195,7 +205,12 @@ pub async fn run_server(mode: ServerMode) -> Result<()> {
         loop {
             let start = std::time::Instant::now();
             match relay_client::RelayClient::new(rcfg.clone())
-                .run(pairing.clone(), trusted.clone(), cfg.clone())
+                .run(
+                    pairing.clone(),
+                    trusted.clone(),
+                    cfg.clone(),
+                    file_send_bridge.clone(),
+                )
                 .await
             {
                 Ok(()) => {
@@ -226,6 +241,7 @@ pub async fn run_server(mode: ServerMode) -> Result<()> {
                 port,
                 relay_cfg: relay_cfg.clone(),
                 mode,
+                file_send_bridge: file_send_bridge.clone(),
             })
             .await
         } else {

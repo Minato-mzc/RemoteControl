@@ -240,6 +240,31 @@ pub fn build_qr_html(
     .iface.relay-tag {{ color: #1f4d8b; font-weight: 600; }}
     .meta {{ font-family: ui-monospace, Consolas, monospace; color: #999;
              font-size: 11px; margin-top: 12px; word-break: break-all; }}
+
+    /* M6 v2: drag-drop area for PC → phone file sends. Stays hidden in
+       the no-connected-session state via JS toggling `.disabled`. */
+    .send {{ max-width: 760px; margin: 28px auto 0; }}
+    .send h2 {{ font-size: 16px; margin: 0 0 8px; color: #333; }}
+    .drop {{ border: 2px dashed #bcd;
+             border-radius: 14px; background: #fafbff;
+             padding: 28px 16px; transition: background .15s, border-color .15s; }}
+    .drop.hot {{ background: #eaf2ff; border-color: #1f4d8b; }}
+    .drop p {{ margin: 6px 0; color: #556; }}
+    .drop .pick {{ display: inline-block; margin-top: 8px; padding: 6px 14px;
+                   border-radius: 999px; background: #1f4d8b; color: #fff;
+                   cursor: pointer; font-size: 13px; font-weight: 600; }}
+    .send.disabled .drop {{ opacity: .55; pointer-events: none; }}
+    .send .hint {{ font-size: 12px; color: #888; margin-top: 8px; }}
+    .send .log {{ margin-top: 12px; text-align: left; font-size: 13px;
+                  max-height: 200px; overflow-y: auto; }}
+    .log .row {{ display: flex; gap: 8px; align-items: center; padding: 6px 8px;
+                 border-radius: 8px; margin-bottom: 4px; background: #fff;
+                 border: 1px solid #eee; }}
+    .log .row.ok {{ border-color: #b8e3c4; background: #f4fbf6; }}
+    .log .row.err {{ border-color: #f1c0c0; background: #fcf3f3; }}
+    .log .row .name {{ flex: 1; font-family: ui-monospace, Consolas, monospace;
+                       font-size: 12px; word-break: break-all; }}
+    .log .row .size {{ color: #888; font-size: 11px; white-space: nowrap; }}
   </style>
 </head>
 <body>
@@ -253,6 +278,92 @@ pub fn build_qr_html(
               font-size: 13px; font-weight: 600;">🔄 刷新二维码</a>
   </p>
   <div class="grid">{tiles}</div>
+
+  <section class="send" id="send">
+    <h2>📤 发文件到手机</h2>
+    <div class="drop" id="drop">
+      <p>把文件拖到这里，或者</p>
+      <label class="pick">
+        选择文件
+        <input type="file" id="pick" multiple style="display:none">
+      </label>
+      <div class="hint">需要手机端已连接。文件会保存到手机 App 私有目录的 Downloads/ 下，文件管理器里能找到。</div>
+    </div>
+    <div class="log" id="log"></div>
+  </section>
+
+  <script>
+    const drop = document.getElementById('drop');
+    const log  = document.getElementById('log');
+    const pick = document.getElementById('pick');
+
+    function fmtBytes(n) {{
+      if (n < 1024) return n + ' B';
+      if (n < 1024*1024) return (n/1024).toFixed(1) + ' KB';
+      if (n < 1024*1024*1024) return (n/1024/1024).toFixed(1) + ' MB';
+      return (n/1024/1024/1024).toFixed(2) + ' GB';
+    }}
+
+    function addLogRow(file) {{
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.innerHTML = '<span>⏳</span><span class="name"></span><span class="size"></span>';
+      row.querySelector('.name').textContent = file.name;
+      row.querySelector('.size').textContent = fmtBytes(file.size);
+      log.prepend(row);
+      return row;
+    }}
+
+    function setRowStatus(row, ok, reason) {{
+      row.classList.remove('ok','err');
+      row.classList.add(ok ? 'ok' : 'err');
+      row.firstChild.textContent = ok ? '✓' : '✗';
+      if (!ok && reason) {{
+        const r = document.createElement('span');
+        r.className = 'size';
+        r.style.color = '#b00020';
+        r.textContent = reason;
+        row.appendChild(r);
+      }}
+    }}
+
+    async function uploadOne(file) {{
+      const row = addLogRow(file);
+      try {{
+        const res = await fetch('/send-file', {{
+          method: 'POST',
+          headers: {{
+            'X-File-Name': encodeURIComponent(file.name),
+            'Content-Type': 'application/octet-stream',
+          }},
+          body: file,
+        }});
+        const json = await res.json().catch(() => ({{ok:false,reason:'bad response'}}));
+        setRowStatus(row, json.ok === true, json.reason || ('HTTP ' + res.status));
+      }} catch (e) {{
+        setRowStatus(row, false, String(e));
+      }}
+    }}
+
+    function handleFiles(files) {{
+      for (const f of files) uploadOne(f);
+    }}
+
+    drop.addEventListener('dragover', e => {{
+      e.preventDefault();
+      drop.classList.add('hot');
+    }});
+    drop.addEventListener('dragleave', () => drop.classList.remove('hot'));
+    drop.addEventListener('drop', e => {{
+      e.preventDefault();
+      drop.classList.remove('hot');
+      if (e.dataTransfer && e.dataTransfer.files) handleFiles(e.dataTransfer.files);
+    }});
+    pick.addEventListener('change', e => {{
+      handleFiles(e.target.files);
+      pick.value = '';
+    }});
+  </script>
 </body>
 </html>"##,
         code = code,
